@@ -348,7 +348,10 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
      * a T29 register-config failure happens after spi_bus_add_device already
      * succeeded). Release it first so repeated init attempts don't leak a
      * device slot — makes init idempotent w.r.t. the handle regardless of
-     * where the previous attempt failed. */
+     * where the previous attempt failed. Safe without a lock only because of
+     * the cross-task invariant documented at idl0_imu_task_reinit_failed()
+     * (imu_task.h) — this only ever runs here for an IMU the drain loop has
+     * already stopped touching. */
     if (s_spi[imu_index] != NULL) {
         spi_bus_remove_device(s_spi[imu_index]);
         s_spi[imu_index] = NULL;

@@ -275,7 +275,10 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
      * a T29 register-config failure happens after i2c_master_bus_add_device
      * already succeeded). Release it first so repeated init attempts don't
      * leak a device slot — makes init idempotent w.r.t. the handle
-     * regardless of where the previous attempt failed. */
+     * regardless of where the previous attempt failed. Safe without a lock
+     * only because of the cross-task invariant documented at
+     * idl0_imu_task_reinit_failed() (imu_task.h) — this only ever runs here
+     * for an IMU the drain loop has already stopped touching. */
     if (s_i2c[imu_index].dev != NULL) {
         i2c_master_bus_rm_device(s_i2c[imu_index].dev);
         s_i2c[imu_index].dev = NULL;

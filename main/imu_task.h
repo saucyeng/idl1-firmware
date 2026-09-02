@@ -42,5 +42,18 @@ idl0_imu_state_t idl0_imu_task_state(void);
  * idl0_session_start() (session.c) right before that session's channel
  * registry is built. ESP_LOGW's the outcome per IMU retried (session-start
  * path — allowed); a no-op for IMUs that are already healthy or were never
- * configured. */
+ * configured.
+ *
+ * Cross-task invariant (no lock backs this — read before changing either
+ * side): this runs on the BLE/session-start task while imu_task_fn's 20 ms
+ * drain loop runs concurrently on the IMU task. That's only safe because
+ * this must only be called for an IMU whose state is ERROR/inactive, and
+ * drain_one()'s imu_is_active() gate means the polling task never touches
+ * such an IMU's handle — the OK→non-OK transition happens synchronously
+ * inside the drain itself, so the two tasks never contend for the same
+ * device handle. If either gate ever changes (e.g. imu_is_active() starts
+ * tolerating a non-OK state, or this function starts retrying an IMU that
+ * isn't down), the device-handle remove/re-add in idl0_imu_init_one*
+ * (imu_driver.c / imu_driver_i2c.c) can race the drain loop into a
+ * use-after-free on the handle. */
 void idl0_imu_task_reinit_failed(void);
