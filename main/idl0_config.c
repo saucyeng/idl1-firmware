@@ -28,11 +28,16 @@ static const char *TAG = "config";
 static int32_t clamp_to_set(const char *field, int32_t value,
                              const int32_t *valid_set, size_t count)
 {
+    /* Distance math runs in int64_t: cJSON saturates an out-of-int32-range
+     * JSON number to INT32_MIN/INT32_MAX rather than rejecting it, so
+     * `value` can arrive at either extreme from an untrusted BLE config
+     * push. `v - value` (or the reverse) on two int32_t at opposite
+     * extremes overflows int32_t, which is UB — widen before subtracting. */
     int32_t best = valid_set[0];
-    int32_t best_dist = (value > best) ? (value - best) : (best - value);
+    int64_t best_dist = (value > best) ? ((int64_t)value - best) : ((int64_t)best - value);
     for (size_t i = 1; i < count; i++) {
         int32_t v = valid_set[i];
-        int32_t dist = (value > v) ? (value - v) : (v - value);
+        int64_t dist = (value > v) ? ((int64_t)value - v) : ((int64_t)v - value);
         if (dist < best_dist) {
             best = v;
             best_dist = dist;
