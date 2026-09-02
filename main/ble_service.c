@@ -29,6 +29,7 @@
 #include "device_id.h"
 #include "diag_log.h"
 #include "idl0_config.h"
+#include "session.h"
 
 static const char *TAG = "ble";
 
@@ -84,6 +85,13 @@ static uint16_t s_status_val_handle;
  * The publisher in status.c builds into a matching 256 B buffer — keep
  * both in lockstep. */
 static char s_status[256] = "WiFi: OFF\nLogging: STOPPED\nBattery: 100%";
+
+/* T12: guards s_status against a torn read. status_access_cb runs on the
+ * NimBLE host task; idl0_ble_publish_status runs from the 1 Hz esp_timer
+ * task and (via command handlers) the host task too — a GATT READ can land
+ * mid-strncpy and see a spliced/unterminated buffer without this. Hold only
+ * across the copy; no NimBLE/mbuf calls while held. */
+static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* True while the §10.4 radio handoff has BLE suspended (WiFi mode owns
  * the radio). Written from the httpd task (/handoff) and whichever task
@@ -311,6 +319,21 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     /* Config push/read handshakes are handled in the BLE layer (it owns the
      * FF05 / FF06 buffers), not routed to the mode-command dispatcher. */
+    bool is_config_cmd = (cmd == IDL0_CMD_CONFIG_BEGIN ||
+                          cmd == IDL0_CMD_CONFIG_COMMIT ||
+                          cmd == IDL0_CMD_CONFIG_READ_BEGIN);
+    if (is_config_cmd && idl0_session_is_running()) {
+        /* T01 / owner ruling (decisions A1): config commands hold the
+         * WiFi/logging-style mutex (\302\2477.2) and are refused with
+         * IDL0_ACK_MUTEX_REFUSED while a session runs, without invoking the
+         * handler below. Without this, CONFIG_COMMIT's blocking SD write on
+         * this task over the shared SPI2 bus (config_commit, above) plus
+         * config_restart_task's ~500 ms reboot race the open session file:
+         * no SESSION_END, truncated file. */
+        ESP_LOGW(TAG, "config command 0x%02X refused: session running (mutex \302\2477.2)",
+                 cmd);
+        return IDL0_ACK_MUTEX_REFUSED;
+    }
     if (cmd == IDL0_CMD_CONFIG_BEGIN) {
         return config_begin();
     }
@@ -335,7 +358,15 @@ static int status_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
         return BLE_ATT_ERR_UNLIKELY;
     }
-    int rc = os_mbuf_append(ctxt->om, s_status, strlen(s_status));
+    /* T12: snapshot under the same critical section idl0_ble_publish_status
+     * uses, so a publish mid-strncpy can't hand back a spliced buffer. The
+     * critical section is copy-only; os_mbuf_append (NimBLE) runs after
+     * it's released. */
+    char status_copy[sizeof(s_status)];
+    portENTER_CRITICAL(&s_status_mux);
+    memcpy(status_copy, s_status, sizeof(status_copy));
+    portEXIT_CRITICAL(&s_status_mux);
+    int rc = os_mbuf_append(ctxt->om, status_copy, strlen(status_copy));
     return (rc == 0) ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
@@ -379,7 +410,29 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         case BLE_GAP_EVENT_CONNECT:
             ESP_LOGI(TAG, "connect; status=%d", event->connect.status);
             if (event->connect.status == 0) {
-                s_conn_handle = event->connect.conn_handle;
+                if (s_suspended) {
+                    /* T13: this link-layer connection completed after
+                     * idl0_ble_suspend()'s ble_gap_adv_stop() — it raced the
+                     * §10.4 WiFi hand-off. Admitting it here would keep BLE
+                     * connected during the hand-off, violating
+                     * ble_service.h:54-57. Terminate and don't store the
+                     * handle. */
+                    ble_gap_terminate(event->connect.conn_handle,
+                                      BLE_ERR_REM_USER_CONN_TERM);
+                } else {
+                    s_conn_handle = event->connect.conn_handle;
+                    /* T14: a status Handle Value Notification is a single
+                     * ATT PDU capped at MTU-3; without an MTU exchange the
+                     * link stays at the 23-byte default and every notify is
+                     * silently truncated to ~20 bytes. Initiate the
+                     * exchange so CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU (256)
+                     * actually takes effect. */
+                    int mtu_rc = ble_gattc_exchange_mtu(event->connect.conn_handle,
+                                                        NULL, NULL);
+                    if (mtu_rc != 0) {
+                        ESP_LOGD(TAG, "ble_gattc_exchange_mtu failed; rc=%d", mtu_rc);
+                    }
+                }
             } else if (!s_suspended) {
                 start_advertising();
             }
@@ -534,9 +587,13 @@ void idl0_ble_publish_status(const char *status_string)
     if (status_string == NULL) {
         return;
     }
-    /* Cache for the next READ of the status characteristic. */
+    /* Cache for the next READ of the status characteristic. T12: the copy +
+     * NUL write must be atomic w.r.t. status_access_cb's read, or a GATT
+     * READ landing mid-strncpy sees a spliced/unterminated buffer. */
+    portENTER_CRITICAL(&s_status_mux);
     strncpy(s_status, status_string, sizeof(s_status) - 1);
     s_status[sizeof(s_status) - 1] = '\0';
+    portEXIT_CRITICAL(&s_status_mux);
 
     /* Notify the connected central, if any. */
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
