@@ -57,6 +57,26 @@ static void emit_fix(const idl0_gps_fix_t *fix)
     idl0_session_on_first_fix(fix->gps_epoch_ms, fix->device_timestamp_us);
 }
 
+/* Dispatch one complete, NUL-terminated line (in `line[0..line_len-1]`) to
+ * the integrator. Shared by the '\n' terminator and the T26 mid-buffer '$'
+ * flush below, since both mark "this line is done." */
+static void dispatch_line(char *line, size_t line_len)
+{
+    line[line_len] = '\0';
+    if (line_len == 0 || line[0] != '$') return;
+    idl0_gps_fix_t fix = {0};
+    if (idl0_gps_feed_line(line, &fix)) {
+        if (idl0_session_is_running()) {
+            emit_fix(&fix);
+        }
+        s_last_fix_us = fix.device_timestamp_us;
+        if (!s_have_fix) {
+            s_have_fix = true;
+            idl0_status_publish();   /* GPS: NOFIX → FIX */
+        }
+    }
+}
+
 static void gps_task_fn(void *arg)
 {
     (void)arg;
@@ -95,22 +115,20 @@ static void gps_task_fn(void *arg)
                 continue;
             }
             if (c == '\n') {
-                line[line_len] = '\0';
-                if (line_len > 0 && line[0] == '$') {
-                    idl0_gps_fix_t fix = {0};
-                    if (idl0_gps_feed_line(line, &fix)) {
-                        if (idl0_session_is_running()) {
-                            emit_fix(&fix);
-                        }
-                        s_last_fix_us = fix.device_timestamp_us;
-                        if (!s_have_fix) {
-                            s_have_fix = true;
-                            idl0_status_publish();   /* GPS: NOFIX → FIX */
-                        }
-                    }
-                }
+                dispatch_line(line, line_len);
                 line_len = 0;
                 continue;
+            }
+            if (c == '$' && line_len > 0) {
+                /* T26: a '$' arriving mid-buffer means the previous
+                 * sentence's CR/LF terminator was dropped/corrupted and
+                 * the two sentences are glued together. Dispatch what's
+                 * buffered as a complete line first (its own checksum
+                 * still validates it), then start the new sentence with
+                 * this '$' — otherwise the trailing sentence is silently
+                 * discarded when the '\n' finally arrives. */
+                dispatch_line(line, line_len);
+                line_len = 0;
             }
             if (line_len < sizeof(line) - 1) {
                 line[line_len++] = (char)c;

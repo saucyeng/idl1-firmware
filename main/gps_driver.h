@@ -45,9 +45,14 @@ idl0_gps_state_t idl0_gps_state(void);
 const char *idl0_gps_state_str(idl0_gps_state_t state);
 
 /* Internal hook used by gps_task's lost-lock watchdog. Forces the
- * driver's state-machine to the given state without touching the
- * integrator's pending fix struct. Do not call from anywhere else —
- * normal transitions happen inside idl0_gps_feed_line. */
+ * driver's state-machine to the given state. Also clears the cached GGA
+ * staleness state (T25): a fix reacquired after a force-to-NOFIX must not
+ * carry forward altitude/fix_quality/satellites from before the lock was
+ * lost — the next RMC emit will re-zero those fields until a fresh GGA
+ * arrives. The integrator's pending fix struct itself is left untouched
+ * (its lat/lon/time fields are overwritten wholesale by the next RMC
+ * anyway). Do not call from anywhere else — normal transitions happen
+ * inside idl0_gps_feed_line. */
 void idl0_gps_force_state(idl0_gps_state_t state);
 
 /* --- NMEA parser — exposed for host-test --- */
@@ -56,11 +61,25 @@ void idl0_gps_force_state(idl0_gps_state_t state);
  * The trailing CR/LF (if any) must already be stripped. */
 bool idl0_nmea_verify_checksum(const char *line);
 
-/* Parses an RMC sentence into the provided fix. Returns true if the
- * sentence is well-formed, checksum passes, and status='A' (active).
- * Fields filled: gps_epoch_ms, latitude_e7, longitude_e7, speed_x100,
- * heading_x100. Other fields are left untouched. */
-bool idl0_nmea_parse_rmc(const char *line, idl0_gps_fix_t *fix);
+/* Result of parsing an RMC sentence. Distinguishes a well-formed sentence
+ * that reports "no fix" (status='V') from one that could not be parsed at
+ * all, so callers can react to "receiver says no fix" (T24) without
+ * conflating it with garbage/corrupt input. */
+typedef enum {
+    IDL0_NMEA_RMC_INVALID = 0,  /* bad checksum, malformed fields, or an
+                                 * out-of-range/non-digit date or time
+                                 * field (T27/T45) — `fix` untouched */
+    IDL0_NMEA_RMC_VOID,         /* well-formed, checksum-valid, status='V'
+                                 * (receiver reports no fix) — `fix` untouched */
+    IDL0_NMEA_RMC_VALID,        /* well-formed, checksum-valid, status='A' —
+                                 * `fix` populated */
+} idl0_nmea_rmc_result_t;
+
+/* Parses an RMC sentence. Fields filled on IDL0_NMEA_RMC_VALID:
+ * gps_epoch_ms, latitude_e7, longitude_e7, speed_x100, heading_x100.
+ * Other fields (and `fix` as a whole on IDL0_NMEA_RMC_INVALID/VOID) are
+ * left untouched. See idl0_nmea_rmc_result_t for the three outcomes. */
+idl0_nmea_rmc_result_t idl0_nmea_parse_rmc(const char *line, idl0_gps_fix_t *fix);
 
 /* Parses a GGA sentence. Fields filled: altitude_x10, fix_quality,
  * satellites. lat/lon are present in GGA but RMC is canonical — we
