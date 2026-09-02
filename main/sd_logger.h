@@ -54,5 +54,13 @@ bool idl0_sd_rename_with_timestamp(int64_t utc_seconds);
 
 bool idl0_sd_close_session(void);
 
+/* T44: discard the currently open session file instead of closing it —
+ * for the header-submit failure path, where the freshly-created
+ * tmp_<boot_ms>.idl0 never received usable data and must not be left
+ * behind as a 0-byte file. No flush (nothing worth durably committing);
+ * closes s_file if open, remove()s the file at the current session path,
+ * and clears the path state. Same mutex discipline as idl0_sd_close_session. */
+void idl0_sd_discard_session(void);
+
 /* Free space in MB on the FAT volume. */
 uint32_t idl0_sd_free_mb(void);

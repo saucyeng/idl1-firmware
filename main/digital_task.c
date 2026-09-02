@@ -55,31 +55,39 @@ static void submit_press_record(uint8_t channel_id, int64_t ts_us, uint8_t value
     }
 }
 
+/* T22: per-event record-building, shared by digital_task_fn's normal loop
+ * and digital_task_stop's drain-on-stop loop so a press queued right before
+ * stop gets the exact same debounce + submit treatment as one processed
+ * live. */
+static void process_press_event(const press_event_t *ev) {
+    if (ev->channel_idx < 0 || (size_t)ev->channel_idx >= s_channel_count) return;
+    const digital_channel_cfg_t *ch = &s_channels[ev->channel_idx];
+
+    /* Software debounce — reject presses within debounce_ms of the last one. */
+    const int64_t since_us = ev->timestamp_us - s_last_press_us[ev->channel_idx];
+    if (since_us < (int64_t)ch->debounce_ms * 1000) return;
+    s_last_press_us[ev->channel_idx] = ev->timestamp_us;
+
+    /* Monotonic press counter (u8 — wraps; press order still derivable). */
+    s_press_counters[ev->channel_idx]++;
+    /* T09 — this task only runs during a session; deleted (not
+     * downgraded) the per-press ESP_LOGI that used to run here.
+     * ESP_LOGD still costs a runtime tag-level check on the logging
+     * path, and a dev build with DEBUG level enabled would print it, so
+     * only removing it fully honours "zero processing while logging"
+     * (§2). Marker presses aren't traced anywhere post-session either;
+     * they're recoverable from the session file's CHANNEL_SAMPLE
+     * records if ever needed. */
+    submit_press_record(ch->channel_id, ev->timestamp_us,
+                        s_press_counters[ev->channel_idx]);
+}
+
 static void digital_task_fn(void *arg) {
     (void)arg;
     press_event_t ev;
     while (true) {
         if (xQueueReceive(s_press_queue, &ev, portMAX_DELAY) != pdTRUE) continue;
-        if (ev.channel_idx < 0 || (size_t)ev.channel_idx >= s_channel_count) continue;
-        const digital_channel_cfg_t *ch = &s_channels[ev.channel_idx];
-
-        /* Software debounce — reject presses within debounce_ms of the last one. */
-        const int64_t since_us = ev.timestamp_us - s_last_press_us[ev.channel_idx];
-        if (since_us < (int64_t)ch->debounce_ms * 1000) continue;
-        s_last_press_us[ev.channel_idx] = ev.timestamp_us;
-
-        /* Monotonic press counter (u8 — wraps; press order still derivable). */
-        s_press_counters[ev.channel_idx]++;
-        /* T09 — this task only runs during a session; deleted (not
-         * downgraded) the per-press ESP_LOGI that used to run here.
-         * ESP_LOGD still costs a runtime tag-level check on the logging
-         * path, and a dev build with DEBUG level enabled would print it, so
-         * only removing it fully honours "zero processing while logging"
-         * (§2). Marker presses aren't traced anywhere post-session either;
-         * they're recoverable from the session file's CHANNEL_SAMPLE
-         * records if ever needed. */
-        submit_press_record(ch->channel_id, ev.timestamp_us,
-                            s_press_counters[ev.channel_idx]);
+        process_press_event(&ev);
     }
 }
 
@@ -128,6 +136,23 @@ void digital_task_stop(void) {
             gpio_isr_handler_remove(s_channels[i].gpio_pin);
         }
     }
+
+    /* T22: drain any press already enqueued but not yet consumed BEFORE
+     * deleting the task/queue below — otherwise a press that landed in the
+     * queue just before stop (possibly the last marker press of the
+     * session) is silently destroyed by vQueueDelete. Non-blocking receive
+     * (0 ticks to wait): only events already sitting in the queue right
+     * now are drained; ISRs were just detached above so no more will
+     * arrive. Each drained event goes through the same record-building
+     * path as digital_task_fn, so the writer-drop counter (T21) still
+     * accounts for it if the writer rejects it. */
+    if (s_press_queue != NULL) {
+        press_event_t ev;
+        while (xQueueReceive(s_press_queue, &ev, 0) == pdTRUE) {
+            process_press_event(&ev);
+        }
+    }
+
     if (s_task != NULL) {
         vTaskDelete(s_task);
         s_task = NULL;

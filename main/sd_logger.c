@@ -133,6 +133,23 @@ bool idl0_sd_open_session(int64_t boot_ms)
             return false;
         }
     }
+    /* T02: a stray handle here (e.g. a caller that skipped
+     * idl0_sd_close_session()/idl0_sd_discard_session() on the previous
+     * session) leaks a FATFS file descriptor. max_files = 4 above means four
+     * leaked handles make every later fopen fail until reboot. Defence-in-
+     * depth close — the race that could produce a stray handle in the first
+     * place is tracked and accepted separately. Same mutex as the rest of
+     * this file's s_file access. */
+    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_file != NULL) {
+            ESP_LOGW(TAG, "open_session: closing stray pre-existing file handle");
+            fflush(s_file);
+            fclose(s_file);
+            s_file = NULL;
+        }
+        xSemaphoreGive(s_file_mutex);
+    }
+
     /* Ensure /sessions exists. mkdir on an existing dir returns an error
      * we deliberately ignore. */
     mkdir(IDL0_SD_MOUNT_POINT "/sessions", 0777);
@@ -261,4 +278,21 @@ bool idl0_sd_close_session(void)
     }
     ESP_LOGI(TAG, "session file closed");
     return ok;
+}
+
+void idl0_sd_discard_session(void)
+{
+    if (s_file_mutex != NULL && xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+        /* T44: no fflush — the file is being discarded, not committed. */
+        if (s_file != NULL) {
+            fclose(s_file);
+            s_file = NULL;
+        }
+        if (s_file_path[0] != '\0') {
+            remove(s_file_path);
+            s_file_path[0] = '\0';
+        }
+        xSemaphoreGive(s_file_mutex);
+    }
+    ESP_LOGW(TAG, "session file discarded");
 }

@@ -11,8 +11,18 @@
 #define IDL0_MODE_BIT_WIFI_UP         BIT0
 #define IDL0_MODE_BIT_LOGGING_ACTIVE  BIT1
 
-/* Returns the global mode event group, lazily creating it on first call.
- * Safe to call from any task. Never returns NULL after first call. */
+/* T17: creates the global mode event group. Must be called once from
+ * app_main, before any task/subsystem that may call idl0_mode_event_group()
+ * or the set/clear/get helpers below, starts. Not safe to call concurrently
+ * with itself or with idl0_mode_event_group() — that race (lost bits, a
+ * leaked group) is exactly what this replaces the old lazy-create with. */
+void idl0_mode_init(void);
+
+/* Returns the global mode event group created by idl0_mode_init(). Safe to
+ * call from any task PROVIDED idl0_mode_init() has already run. Does not
+ * create the group itself; if idl0_mode_init() was never called (or failed),
+ * logs an error and returns NULL — callers already tolerate a NULL/no-op
+ * mode group during degraded boot. */
 EventGroupHandle_t idl0_mode_event_group(void);
 
 /* Atomically sets the given bits in the global mode event group. */

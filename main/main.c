@@ -21,6 +21,7 @@
 #include "idl0_config.h"
 #include "imu_task.h"
 #include "led_status.h"
+#include "mode_state.h"
 #include "ota.h"
 #include "pins.h"
 #include "sd_logger.h"
@@ -59,6 +60,8 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
             break;
         case IDL0_CMD_CALIBRATE_IMU:
             ESP_LOGI(TAG, "command: CALIBRATE_IMU (no-op until IMU bring-up)");
+            // TODO(idl0): real calibration flow (spec §7.6)
+            ack = IDL0_ACK_NOT_IMPLEMENTED;  /* T15: no-op, not success */
             break;
         case IDL0_CMD_OTA_CONFIRM:
             ESP_LOGI(TAG, "command: OTA_CONFIRM");
@@ -93,11 +96,17 @@ void app_main(void)
      * rolls back to the previous slot. */
     idl0_ota_init();
 
+    /* T17: create the mode event group once, here, before any task or
+     * subsystem that could call idl0_mode_set_bits/_clear_bits/_get_bits or
+     * idl0_mode_event_group() starts — removes the old lazy check-then-act
+     * create race on first concurrent callers. */
+    idl0_mode_init();
+
     if (!idl0_led_init()) {
-        ESP_LOGE(TAG, "LED init failed; halting");
-        for (;;) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        /* T16: the LED is non-essential — halting here forever meant the
+         * device never reset, so a bad OTA image was never rolled back and
+         * BLE/WiFi never came up. Log and continue booting instead. */
+        ESP_LOGE(TAG, "LED init failed; continuing without status LED");
     }
     idl0_led_set(IDL0_LED_BLINK_SLOW);
 

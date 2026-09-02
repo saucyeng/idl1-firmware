@@ -38,6 +38,23 @@ static bool s_first_fix_anchored = false;
 
 bool idl0_session_is_running(void) { return s_running; }
 
+/* T03: idl0_writer_drain(500) can time out under a >500 ms SD stall — a
+ * single call is not enough of a guarantee for the stop path, where a
+ * missed drain silently drops trailing records or SESSION_END itself.
+ * Loop until the ring buffer empties or a 5000 ms (5 s) cap is hit — 10
+ * iterations of the 500 ms per-call timeout. `phase` names the call site
+ * for the timeout log. */
+static void idl0_session_drain_or_log(const char *phase)
+{
+    for (int i = 0; i < 10; i++) {          /* 10 x 500 ms = 5000 ms (5 s) cap */
+        if (idl0_writer_drain(500 /* ms */)) {
+            return;
+        }
+    }
+    ESP_LOGE(TAG, "stop: writer drain timed out after 10 iterations (5000 ms) before %s",
+             phase);
+}
+
 /* IMU axis descriptors: one entry per bit position in imu_channel_mask.
  * Bits 0-5 = IMU0 (accel XYZ then gyro XYZ), 6-11 = IMU1, 12-17 = IMU2.
  * Indexed by (imu_index * 6 + axis_within_imu). */
@@ -219,9 +236,23 @@ bool idl0_session_start(void)
         registry_count, registry);
     if (hlen == 0 || !idl0_writer_submit(header, hlen)) {
         ESP_LOGE(TAG, "start: header write failed");
-        idl0_sd_close_session();
+        /* T44: the just-created tmp_<boot_ms>.idl0 never received usable
+         * data — discard it instead of close(), which would leave a 0-byte
+         * file behind on the card. */
+        idl0_sd_discard_session();
         return false;
     }
+
+    /* T10: start the marker-button GPIO reader (queue/task/ISR allocation)
+     * BEFORE s_running flips true. Other tasks treat s_running==true as
+     * "logging active" and start touching digital_task state; allocating
+     * after that point races them against a still-forming task. Failure
+     * semantics unchanged: digital_task_start logs and returns on error,
+     * leaving markers disabled for the session — start proceeds regardless.
+     * digital_task_start is idempotent and bails when count==0, so this is
+     * a no-op for profiles without markers. The channel_ids were just
+     * assigned above in the registry loop. */
+    digital_task_start(cfg.digital_channels, cfg.digital_channel_count);
 
     s_running = true;
     s_first_fix_anchored = false;
@@ -233,13 +264,6 @@ bool idl0_session_start(void)
     hrm_task_diag_reset();
     digital_task_diag_reset();
     idl0_led_set(IDL0_LED_BLINK_FAST);
-
-    /* Start the marker-button GPIO reader if any digital channels are
-     * configured. digital_task_start is idempotent and bails when count==0,
-     * so this is a no-op for profiles without markers. The channel_ids were
-     * just assigned above in the registry loop. */
-    digital_task_start(cfg.digital_channels, cfg.digital_channel_count);
-
     ESP_LOGI(TAG, "session started (schema v3, %u registry entries)", registry_count);
     idl0_mode_set_bits(IDL0_MODE_BIT_LOGGING_ACTIVE);
     idl0_status_publish();
@@ -259,12 +283,12 @@ bool idl0_session_stop(void)
      * task has already enqueued while s_running was still true. */
     s_running = false;
     digital_task_stop();
-    idl0_writer_drain(500);
+    idl0_session_drain_or_log("SESSION_END submit");
 
     uint8_t end[3];
     size_t n = idl0_format_session_end(end);
     idl0_writer_submit(end, n);
-    idl0_writer_drain(500);
+    idl0_session_drain_or_log("session close");
     idl0_sd_close_session();
 
     /* Session file is closed — safe to write the drain summary to the diag log
