@@ -15,32 +15,63 @@
 #include "sd_logger.h"
 #include "session.h"
 #include "wifi_server.h"
+#include "writer_task.h"
 
 static const char *TAG = "status";
 
 static esp_timer_handle_t s_publish_timer = NULL;
 
-/* Sized for the §7.3 nine-line worst case (six base + OTA + HR + HR_Battery).
- * Each line max ~30 bytes; 256 gives ample headroom and matches the BLE
- * preferred MTU (§6 — CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256). Keep in
- * lockstep with s_status in ble_service.c. */
+/* Sized for the §7.3 eleven-line worst case (six base + SD_Free + SD_Total
+ * + OTA + HR + HR_Battery — the two SD capacity lines only appear together
+ * with a non-ABSENT SD: token, per A7). Recomputed field-by-field with every
+ * variable-length token at its max (WiFi 3 "OFF", Logging 7 "RUNNING", SD
+ * 5 "ERROR", SD_Free/SD_Total 10 digits each — full uint32_t range, GPS 6
+ * "ABSENT", IMU 7 "PARTIAL", Firmware 31 = esp_app_desc_t.version[32] minus
+ * the NUL, OTA fixed 19 "OTA: PENDING_VERIFY", HR 18 "HR: NO_CONTACT 255",
+ * HR_Battery 16 "HR_Battery: 255%"): 220 bytes + NUL = 221. 256 leaves 35
+ * bytes of headroom and matches the BLE preferred MTU (§6 —
+ * CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256). Keep in lockstep with s_status
+ * in ble_service.c. */
 #define IDL0_STATUS_BUF_BYTES 256
 
 void idl0_status_publish(void)
 {
     char status[IDL0_STATUS_BUF_BYTES];
+    const idl0_sd_state_t sd_state = idl0_sd_state();
+
     /* TODO(idl0): pull Battery from the battery driver (§10.1) once
      * that subsystem lands. */
     int n = snprintf(status, sizeof(status),
-             "WiFi: %s\nLogging: %s\nBattery: 100%%\nSD: %s\nGPS: %s\nIMU: %s\nFirmware: %s",
+             "WiFi: %s\nLogging: %s\nBattery: 100%%\nSD: %s",
              idl0_wifi_state_str(idl0_wifi_state()),
              idl0_session_is_running() ? "RUNNING" : "STOPPED",
-             idl0_sd_state_str(idl0_sd_state()),
-             idl0_gps_state_str(idl0_gps_state()),
-             idl0_imu_state_str(idl0_imu_state()),
-             esp_app_get_description()->version);
+             idl0_sd_state_str(sd_state));
     if (n < 0) return;
     size_t cursor = (size_t)n;
+
+    /* A7 (decisions, narrowed scope) / R2: card capacity + usage, directly
+     * after SD: in the emit order. Omitted entirely when ABSENT (no card to
+     * report on) rather than printing 0/0 — §7.3 says unknown lines are
+     * ignored by the app, so adding these is additive-safe either way.
+     * Values come from sd_logger's cache (idl0_sd_free_mb/idl0_sd_total_mb)
+     * — never a live FATFS query here, since this runs at 1 Hz whether or
+     * not a session is active (see sd_logger.c for the refresh points). */
+    if (cursor < sizeof(status) && sd_state != IDL0_SD_ABSENT) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nSD_Free: %u MB\nSD_Total: %u MB",
+                           (unsigned)idl0_sd_free_mb(),
+                           (unsigned)idl0_sd_total_mb());
+        if (add > 0) cursor += (size_t)add;
+    }
+
+    if (cursor < sizeof(status)) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nGPS: %s\nIMU: %s\nFirmware: %s",
+                           idl0_gps_state_str(idl0_gps_state()),
+                           idl0_imu_state_str(idl0_imu_state()),
+                           esp_app_get_description()->version);
+        if (add > 0) cursor += (size_t)add;
+    }
 
     if (cursor < sizeof(status) && idl0_ota_pending_verify()) {
         int add = snprintf(status + cursor, sizeof(status) - cursor,
@@ -94,6 +125,19 @@ void idl0_status_publish(void)
 static void publish_timer_cb(void *arg)
 {
     (void)arg;
+    /* T04 mechanism, half 2 (§10.2 / A7 ruling, verbatim): SD FULL/ERROR
+     * mid-session must stop the session and report it over BLE — no new
+     * task, the 1 Hz status timer does both. Checked here, before building
+     * the status string, so the same publish below already reflects the
+     * post-stop state ("SD: FULL|ERROR" / "Logging: STOPPED").
+     * idl0_session_stop()'s bounded drain loop is safe to run on the
+     * esp_timer task: the writer keeps consuming queued items even while
+     * idl0_sd_append is failing (it just counts the failure and moves on),
+     * so the ring buffer empties well inside the drain's cap rather than
+     * timing out and blocking this task. */
+    if (idl0_writer_sd_fault() && idl0_session_is_running()) {
+        idl0_session_stop();
+    }
     idl0_status_publish();
 }
 

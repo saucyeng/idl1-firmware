@@ -62,5 +62,10 @@ bool idl0_sd_close_session(void);
  * and clears the path state. Same mutex discipline as idl0_sd_close_session. */
 void idl0_sd_discard_session(void);
 
-/* Free space in MB on the FAT volume. */
+/* Free space in MB on the FAT volume. Cached — see sd_logger.c's refresh
+ * points — not a live query, so safe to call from the 1 Hz status timer. */
 uint32_t idl0_sd_free_mb(void);
+
+/* Total capacity in MB of the FAT volume (§10.2 / A7 capacity lines). Same
+ * cache and refresh points as idl0_sd_free_mb(); 0 when no card is mounted. */
+uint32_t idl0_sd_total_mb(void);

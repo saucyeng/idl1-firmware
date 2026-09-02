@@ -78,9 +78,11 @@ static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_status_val_handle;
 
 /* Latest status string (§7.3). Served on READ and sent on NOTIFY.
- * Sized for the nine §7.3 lines worst case (six base + optional OTA,
- * HR, HR_Battery). The publisher in status.c builds into a matching
- * 256 B buffer — keep both in lockstep. */
+ * Sized for the eleven §7.3 lines worst case (six base + optional SD_Free,
+ * SD_Total, OTA, HR, HR_Battery) — recomputed to 220 bytes + NUL; see the
+ * IDL0_STATUS_BUF_BYTES comment in status.c for the field-by-field count.
+ * The publisher in status.c builds into a matching 256 B buffer — keep
+ * both in lockstep. */
 static char s_status[256] = "WiFi: OFF\nLogging: STOPPED\nBattery: 100%";
 
 /* True while the §10.4 radio handoff has BLE suspended (WiFi mode owns

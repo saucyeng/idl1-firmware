@@ -260,6 +260,7 @@ bool idl0_session_start(void)
     /* Zero the per-session writer-drop / append-failure counters (T05/T08/
      * T21) so the session-end summary below reflects only this session. */
     idl0_writer_diag_reset();
+    idl0_writer_clear_sd_fault();  /* T04: fresh session starts fault-free */
     gps_task_diag_reset();
     hrm_task_diag_reset();
     digital_task_diag_reset();

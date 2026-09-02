@@ -77,6 +77,14 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
 CONFIG_ESPTOOLPY_FLASHSIZE_DETECT=y
 
+# esp_timer task stack: 6 KB (default 3584 B). idl0_session_stop() now runs
+# on this task in the SD-fault case (T04, §10.2): the 1 Hz status timer's
+# esp_timer callback calls it directly when the writer task's SD-fault flag
+# is set. Its call chain (bounded drain loop + idl0_sd_close_session + LED +
+# idl0_status_publish -> BLE notify) is deeper than anything else that ran
+# on this task before; the default left no margin for it.
+CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
+
 # §4.6 OTA rollback: a freshly OTA'd image boots ESP_OTA_IMG_PENDING_VERIFY
 # and the bootloader rolls back to the previous slot on reboot unless the
 # app commits it via CMD_OTA_CONFIRM (§7.2). Without this flag the state

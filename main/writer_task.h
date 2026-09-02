@@ -38,3 +38,12 @@ uint32_t idl0_writer_diag_append_failures(void);
 /* Zero the append-failure counter. Called by the session layer at
  * idl0_session_start() so each session's summary starts from zero. */
 void idl0_writer_diag_reset(void);
+
+/* T04: true once an idl0_sd_append failure has been observed while
+ * idl0_sd_state() reads IDL0_SD_FULL or IDL0_SD_ERROR. Polled by the 1 Hz
+ * status timer (status.c) to trigger stop-and-report (§10.2 / A7). */
+bool idl0_writer_sd_fault(void);
+
+/* Clear the SD-fault flag. Called by idl0_session_start() alongside the
+ * other diag resets so each session starts fault-free. */
+void idl0_writer_clear_sd_fault(void);

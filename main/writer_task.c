@@ -24,6 +24,13 @@ static TaskHandle_t    s_task = NULL;
 static uint32_t s_append_fail_count;
 static bool     s_append_fail_logged;  /* true once ESP_LOGW fired for this failing run */
 
+/* T04: latched once an append failure lines up with SD FULL/ERROR. Written
+ * only here (writer task); read by idl0_writer_sd_fault() from the esp_timer
+ * task (status.c's 1 Hz publish callback). volatile makes that cross-task
+ * read see the write promptly; no atomics needed for the bool itself — the
+ * C6 is single-core, so a plain bool store/load can't tear. */
+static volatile bool s_sd_fault;
+
 static void writer_task_fn(void *arg)
 {
     (void)arg;
@@ -44,6 +51,16 @@ static void writer_task_fn(void *arg)
                     ESP_LOGW(TAG, "append failing (%u bytes) — further failures counted silently",
                              (unsigned)item_size);
                     s_append_fail_logged = true;
+                }
+                /* T04: an append failure while the card reads FULL or ERROR
+                 * means the session can no longer log — latch the fault so
+                 * the status timer stops the session and reports it over BLE
+                 * (§10.2 / A7). Any other append failure (e.g. a transient
+                 * SPI error state hasn't caught up to yet) leaves the flag
+                 * alone. */
+                idl0_sd_state_t sd_state = idl0_sd_state();
+                if (sd_state == IDL0_SD_FULL || sd_state == IDL0_SD_ERROR) {
+                    s_sd_fault = true;
                 }
             }
             vRingbufferReturnItem(s_rb, item);
@@ -126,4 +143,14 @@ void idl0_writer_diag_reset(void)
 {
     s_append_fail_count  = 0;
     s_append_fail_logged = false;
+}
+
+bool idl0_writer_sd_fault(void)
+{
+    return s_sd_fault;
+}
+
+void idl0_writer_clear_sd_fault(void)
+{
+    s_sd_fault = false;
 }

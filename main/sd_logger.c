@@ -42,6 +42,36 @@ static char              s_file_path[64] = {0};
 #define IDL0_SD_IO_BUF_BYTES (16 * 1024)
 static char s_io_buf[IDL0_SD_IO_BUF_BYTES];
 
+/* T04/A7 capacity cache (§10.2). esp_vfs_fat_info() walks f_getfree() over
+ * the shared SPI bus, so it must not run on every 1 Hz status tick — the
+ * status publisher reads these cached values instead. Refreshed at mount,
+ * session open/close, and on each successful idl0_sd_flush() (piggybacked
+ * on the fsync there, which already touches the FAT). Outside an active
+ * session the values may be up to one session stale; acceptable per A7. */
+static uint32_t s_free_mb  = 0;
+static uint32_t s_total_mb = 0;
+
+/* Single esp_vfs_fat_info() query refreshes both cached values — it already
+ * derives total bytes from the same f_getfree() call free space comes from
+ * (fs->n_fatent - 2) * fs->csize * sector_size internally, so there is no
+ * separate "total" query to worry about calling too often. */
+static void sd_refresh_capacity_mb(void)
+{
+    if (s_card == NULL) {
+        s_free_mb  = 0;
+        s_total_mb = 0;
+        return;
+    }
+    uint64_t total_bytes = 0, free_bytes = 0;
+    esp_err_t err = esp_vfs_fat_info(IDL0_SD_MOUNT_POINT, &total_bytes, &free_bytes);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "esp_vfs_fat_info failed: %s", esp_err_to_name(err));
+        return;
+    }
+    s_free_mb  = (uint32_t)(free_bytes  / (1024ULL * 1024ULL));
+    s_total_mb = (uint32_t)(total_bytes / (1024ULL * 1024ULL));
+}
+
 idl0_sd_state_t idl0_sd_state(void) { return s_state; }
 
 const char *idl0_sd_state_str(idl0_sd_state_t state)
@@ -57,16 +87,12 @@ const char *idl0_sd_state_str(idl0_sd_state_t state)
 
 uint32_t idl0_sd_free_mb(void)
 {
-    if (s_card == NULL) {
-        return 0;
-    }
-    uint64_t total_bytes = 0, free_bytes = 0;
-    esp_err_t err = esp_vfs_fat_info(IDL0_SD_MOUNT_POINT, &total_bytes, &free_bytes);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_vfs_fat_info failed: %s", esp_err_to_name(err));
-        return 0;
-    }
-    return (uint32_t)(free_bytes / (1024ULL * 1024ULL));
+    return s_free_mb;
+}
+
+uint32_t idl0_sd_total_mb(void)
+{
+    return s_total_mb;
 }
 
 bool idl0_sd_init(spi_host_device_t spi_host)
@@ -113,10 +139,11 @@ bool idl0_sd_init(spi_host_device_t spi_host)
         return false;
     }
 
-    uint32_t free_mb = idl0_sd_free_mb();
-    s_state = (free_mb >= IDL0_SD_MIN_FREE_MB) ? IDL0_SD_OK : IDL0_SD_FULL;
-    ESP_LOGI(TAG, "SD mounted: %lu MB free, state %s",
-             (unsigned long)free_mb, idl0_sd_state_str(s_state));
+    sd_refresh_capacity_mb();   /* mount: prime both cached values (§ above) */
+    s_state = (s_free_mb >= IDL0_SD_MIN_FREE_MB) ? IDL0_SD_OK : IDL0_SD_FULL;
+    ESP_LOGI(TAG, "SD mounted: %lu/%lu MB free/total, state %s",
+             (unsigned long)s_free_mb, (unsigned long)s_total_mb,
+             idl0_sd_state_str(s_state));
     return true;
 }
 
@@ -164,6 +191,7 @@ bool idl0_sd_open_session(int64_t boot_ms)
     }
     setvbuf(s_file, s_io_buf, _IOFBF, sizeof(s_io_buf));   /* cluster-sized writes */
     ESP_LOGI(TAG, "session file: %s", s_file_path);
+    sd_refresh_capacity_mb();   /* session start: cache refresh point (§ above) */
     return true;
 }
 
@@ -224,6 +252,12 @@ bool idl0_sd_flush(void)
         }
         xSemaphoreGive(s_file_mutex);
     }
+    if (ok) {
+        /* Cache refresh piggybacked on the fsync above — the FAT is already
+         * being touched here, so this is the ~1 Hz cadence the capacity
+         * cache rides during a session, not an extra SPI-bus hit (§ above). */
+        sd_refresh_capacity_mb();
+    }
     return ok;
 }
 
@@ -276,6 +310,7 @@ bool idl0_sd_close_session(void)
     } else {
         ok = false;
     }
+    sd_refresh_capacity_mb();   /* session stop: cache refresh point (§ above) */
     ESP_LOGI(TAG, "session file closed");
     return ok;
 }
