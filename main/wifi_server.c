@@ -533,7 +533,8 @@ static esp_err_t handoff_post_handler(httpd_req_t *req)
  * idl0_wifi_stop_deferred() (T11). Runs in the esp_timer task — NOT the
  * httpd task, and NOT the BLE/NimBLE host task — because httpd_stop()
  * joins the httpd task and would deadlock/stall its caller if invoked
- * directly from either. Created lazily, reused across WiFi sessions. */
+ * directly from either. Created once in idl0_wifi_start() (see
+ * ensure_wifi_off_timer below), reused across WiFi sessions. */
 static esp_timer_handle_t s_wifi_off_timer = NULL;
 
 static void wifi_off_timer_cb(void *arg)
@@ -545,29 +546,63 @@ static void wifi_off_timer_cb(void *arg)
     idl0_status_publish();
 }
 
-/* Creates s_wifi_off_timer on first use and (re-)arms it for a callback
- * 500 ms out. Single implementation shared by POST /wifi_off and
- * idl0_wifi_stop_deferred() so there is exactly one deferred-stop path
- * (T11) — not two copies of the same timer dance.
+/* Creates s_wifi_off_timer if it doesn't exist yet. Called exactly once
+ * per boot, from idl0_wifi_start() before httpd_start() — NOT lazily
+ * from arm_wifi_off_timer() below. That used to be lazy-in-arm, but
+ * arm_wifi_off_timer() is now reachable from two tasks (the httpd worker
+ * via POST /wifi_off, and the NimBLE host task via
+ * idl0_wifi_stop_deferred(), T11): a first-call race between them could
+ * create two esp_timer handles and leak/orphan one. idl0_wifi_start() is
+ * only ever invoked from the single task that owns CMD_WIFI_ON (main.c's
+ * BLE command dispatcher, itself serialized), so creation here has
+ * exactly one caller and needs no additional lock. */
+static void ensure_wifi_off_timer(void)
+{
+    if (s_wifi_off_timer != NULL) return;
+    const esp_timer_create_args_t args = {
+        .callback = wifi_off_timer_cb,
+        .name     = "wifi_off",
+    };
+    esp_err_t err = esp_timer_create(&args, &s_wifi_off_timer);
+    if (err != ESP_OK) {
+        /* Non-fatal to AP/HTTP bring-up: POST /wifi_off and
+         * idl0_wifi_stop_deferred() both degrade to a clean error via
+         * arm_wifi_off_timer()'s NULL check below instead of a crash —
+         * WiFi mode just can't be torn down deferred until next boot. */
+        ESP_LOGW(TAG, "wifi_off timer create failed: %s", esp_err_to_name(err));
+    }
+}
+
+/* Arms the deferred-stop timer for a callback 500 ms out. Arms only —
+ * does NOT create; see ensure_wifi_off_timer() above for why creation
+ * moved to idl0_wifi_start()'s single-threaded path.
  *
- * Idempotence: esp_timer_start_once() on a one-shot timer that is
- * already armed returns ESP_ERR_INVALID_STATE without re-arming or
- * re-queuing it, so two stops queued back-to-back (e.g. BLE
- * CMD_WIFI_OFF racing a POST /wifi_off, or either one arriving twice)
- * collapse onto the single pending callback — treated here as success,
- * not an error. idl0_wifi_stop() itself is also idempotent (it
- * short-circuits when already IDL0_WIFI_OFF), so even a spurious extra
- * fire of the callback is a no-op. Returns the real error only if timer
- * creation or the first arm fails. */
+ * s_wifi_off_timer == NULL here means either ensure_wifi_off_timer()'s
+ * create failed (logged there) or WiFi was never started this boot at
+ * all (e.g. BLE CMD_WIFI_OFF arriving while already IDL0_WIFI_OFF, so
+ * idl0_wifi_start() never ran and never created the timer). Either way
+ * there is nothing to defer — idl0_wifi_stop() would itself no-op on an
+ * already-OFF state — so this returns an error instead of dereferencing
+ * a NULL handle, rather than crashing. idl0_wifi_stop_deferred() below
+ * treats that error as a harmless no-op; wifi_off_post_handler still
+ * surfaces it as a 500 (pre-existing behaviour, unchanged by this fix —
+ * POST /wifi_off can only be reached once httpd is up, which requires
+ * idl0_wifi_start() to have already run ensure_wifi_off_timer(), so in
+ * practice that path only 500s if timer creation itself failed at
+ * startup).
+ *
+ * Idempotence (for the case the timer does exist): esp_timer_start_once()
+ * on a one-shot timer that is already armed returns
+ * ESP_ERR_INVALID_STATE without re-arming or re-queuing it, so two stops
+ * queued back-to-back (e.g. BLE CMD_WIFI_OFF racing a POST /wifi_off, or
+ * either one arriving twice) collapse onto the single pending callback —
+ * treated here as success, not an error. idl0_wifi_stop() itself is also
+ * idempotent (it short-circuits when already IDL0_WIFI_OFF), so even a
+ * spurious extra fire of the callback is a no-op. */
 static esp_err_t arm_wifi_off_timer(void)
 {
     if (s_wifi_off_timer == NULL) {
-        const esp_timer_create_args_t args = {
-            .callback = wifi_off_timer_cb,
-            .name     = "wifi_off",
-        };
-        esp_err_t err = esp_timer_create(&args, &s_wifi_off_timer);
-        if (err != ESP_OK) return err;
+        return ESP_ERR_INVALID_STATE;
     }
     esp_err_t err = esp_timer_start_once(s_wifi_off_timer, 500 * 1000);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
@@ -580,7 +615,10 @@ static esp_err_t arm_wifi_off_timer(void)
  * on httpd_stop() joining the httpd worker — stalling ALL BLE command
  * processing for however long an in-flight handler (large /download, a
  * stalled /ota) takes to finish. See arm_wifi_off_timer() for the
- * idempotence guarantee covering repeated/racing calls. */
+ * idempotence guarantee covering repeated/racing calls, and for why a
+ * NULL timer (WiFi never started this boot) is a safe no-op here rather
+ * than an error worth surfacing — idl0_wifi_stop() has nothing to do in
+ * that case either. */
 void idl0_wifi_stop_deferred(void)
 {
     esp_err_t err = arm_wifi_off_timer();
@@ -785,6 +823,14 @@ bool idl0_wifi_start(void)
      * backs a receive buffer) while covering handoff + reconnect. */
     hcfg.lru_purge_enable  = true;
     hcfg.max_open_sockets  = 4;
+
+    /* Create the deferred-stop timer before the httpd server starts, on
+     * this single-threaded call path (T11 concurrency fix) — so that by
+     * the time POST /wifi_off can possibly be reached, s_wifi_off_timer
+     * is already non-NULL. See ensure_wifi_off_timer()'s doc comment for
+     * why this can no longer be done lazily inside arm_wifi_off_timer(). */
+    ensure_wifi_off_timer();
+
     err = httpd_start(&s_httpd, &hcfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err));
