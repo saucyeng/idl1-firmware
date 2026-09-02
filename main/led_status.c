@@ -15,6 +15,12 @@ static const char *TAG = "led";
 
 static TimerHandle_t s_blink_timer = NULL;
 static bool s_blink_phase = false;
+/* T16: set true only once idl0_led_init() fully succeeds (GPIO configured
+ * AND the blink timer created). idl0_led_set() no-ops while false instead
+ * of touching a NULL/half-initialised s_blink_timer, so a boot that
+ * survives a failed LED init doesn't then crash on the first status
+ * update. */
+static bool s_initialized = false;
 
 static void apply_level(bool on)
 {
@@ -48,11 +54,15 @@ bool idl0_led_init(void)
         ESP_LOGE(TAG, "xTimerCreate failed");
         return false;
     }
+    s_initialized = true;
     return true;
 }
 
 void idl0_led_set(idl0_led_pattern_t pattern)
 {
+    if (!s_initialized) {
+        return;  /* T16: init failed — LED is non-essential, no-op rather than touch a NULL timer */
+    }
     xTimerStop(s_blink_timer, 0);
     s_blink_phase = false;
 
