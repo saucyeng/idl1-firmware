@@ -167,9 +167,13 @@ static int test_imu_sample(void) {
 
     /* IMU1 (mask bits 6-11), only gyro_x enabled -> bit 9 set. */
     n = idl0_format_imu_sample(buf, 1, 0LL, 0x200u, axes);
-    CHECK(n == 12);                          /* 3 + 1 + 8 + 2 */
+    CHECK(n == 14);                          /* 3 + 1 + 8 + 2 = 14 */
     CHECK(buf[3] == 1);                      /* imu_index */
     CHECK(rd_i16(buf + 12) == -400);         /* axes[3] = gyro_x */
+
+    /* T46: guard against imu_index > 5 (shift ≥ 32 bits undefined) */
+    n = idl0_format_imu_sample(buf, 6, 0LL, 0u, axes);
+    CHECK(n == 0);                           /* imu_index out of range */
     return 0;
 }
 
@@ -208,6 +212,13 @@ static int test_channel_sample(void) {
     CHECK(((uint16_t)buf[1] | ((uint16_t)buf[2] << 8)) == 13);
     CHECK(buf[3] == 0);                       /* channel_id */
     CHECK(rd_u32(buf + 12) == 0x11223344u);   /* value at 3+1+8 */
+
+    /* T46: guard against value_len < 1 or > 8 (documented 1..8 bytes) */
+    uint8_t dummy[1] = {0};
+    n = idl0_format_channel_sample(buf, 0, 0LL, dummy, 0);
+    CHECK(n == 0);                            /* value_len 0 is out of range */
+    n = idl0_format_channel_sample(buf, 0, 0LL, dummy, 9);
+    CHECK(n == 0);                            /* value_len 9 is out of range */
     return 0;
 }
 

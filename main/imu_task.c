@@ -125,6 +125,11 @@ static uint8_t           s_batch[IMU_DRAIN_MAX_PAIRS * 24];
 static void drain_one(uint8_t imu_index, int64_t period_us)
 {
     if (!imu_is_active(imu_index)) return;
+    /* T20: require mask has at least one channel bit set. No registry entries
+     * exist for a maskless IMU — such records would be unexplainable overhead
+     * (~12 bytes every ~20 ms for the session). */
+    uint32_t imu_bits = (s_channel_mask >> (imu_index * 6)) & 0x3Fu;
+    if (imu_bits == 0) return;
 
     /* Snapshot the read instant before draining so all per-sample
      * timestamps anchor on the same t_read for this IMU. */

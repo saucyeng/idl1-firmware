@@ -100,6 +100,7 @@ size_t idl0_format_imu_sample(uint8_t *out_buf,
                               const int16_t axes[6])
 {
     /* The six axis bits for this IMU live at mask offset imu_index*6. */
+    if (imu_index > 5) return 0;  /* mask holds at most 5 six-bit groups in 32 bits; real hardware uses 0..2 */
     uint32_t imu_bits = (imu_channel_mask >> (imu_index * 6)) & 0x3Fu;
 
     size_t pos = 3;  /* leave room for the 3-byte framing header */
@@ -150,6 +151,7 @@ size_t idl0_format_channel_sample(uint8_t *out_buf,
                                   const void *value,
                                   size_t value_len)
 {
+    if (value_len < 1 || value_len > 8) return 0;  /* §5.3: value_len is 1..8 bytes per registry data_type */
     size_t pos = 3;
     put_u8(out_buf, &pos, channel_id);
     put_i64(out_buf, &pos, timestamp_us);

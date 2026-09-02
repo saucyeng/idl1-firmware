@@ -39,7 +39,9 @@ before touching code.
   logging path. Analysis DSP — filtering, integration, FFT — never runs on
   this device, in any mode. That work is idl-rs (app repo). Non-logging
   activity (boot, calibration, file transfer, config, OTA) may compute as
-  needed.
+  needed. This rule means zero *data* processing on the logging path, not
+  zero activity — the BLE control plane (1 Hz status publish, command acks)
+  is exempt, as is NMEA→GPS_FIX decode (§5.6: format conversion required by spec).
 - **Toolchain is fixed:** ESP-IDF v6.0.1, target `esp32c6`. Don't upgrade
   either without a spec-first task (CI pins the same version — see
   `.github/workflows/firmware-release.yml`).
