@@ -10,6 +10,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_ota_ops.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 
@@ -210,15 +211,32 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     long start = 0, end = total - 1;
     bool partial = false;
 
-    /* Range header: "bytes=START-END" or "bytes=START-". */
+    /* Range header: "bytes=START-END", "bytes=START-", or the suffix form
+     * "bytes=-N" meaning "the last N bytes" (RFC 7233 §2.1). */
     char range[64];
     if (httpd_req_get_hdr_value_str(req, "Range", range, sizeof(range)) == ESP_OK) {
-        long rs = 0, re = -1;
-        if (sscanf(range, "bytes=%ld-%ld", &rs, &re) >= 1) {
-            if (rs >= 0 && rs < total) {
-                start   = rs;
-                end     = (re >= 0 && re < total) ? re : total - 1;
+        static const char prefix[] = "bytes=";
+        size_t prefix_len = sizeof(prefix) - 1;
+        if (strncmp(range, prefix, prefix_len) == 0 && range[prefix_len] == '-') {
+            /* Suffix form: sscanf("bytes=%ld-%ld", ...) below would parse
+             * this as rs=-N, which fails the rs >= 0 guard and drops the
+             * whole header (client got 200 + full file instead of 206 +
+             * tail) — detect it explicitly instead. */
+            long n = 0;
+            if (sscanf(range + prefix_len + 1, "%ld", &n) == 1 && n > 0) {
+                start   = (n < total) ? total - n : 0;
+                end     = total - 1;
                 partial = true;
+            }
+            /* n <= 0 is malformed — ignore the header, same as today. */
+        } else {
+            long rs = 0, re = -1;
+            if (sscanf(range, "bytes=%ld-%ld", &rs, &re) >= 1) {
+                if (rs >= 0 && rs < total) {
+                    start   = rs;
+                    end     = (re >= 0 && re < total) ? re : total - 1;
+                    partial = true;
+                }
             }
         }
     }
@@ -355,13 +373,38 @@ static esp_err_t config_post_handler(httpd_req_t *req)
  * /download — fits comfortably in the 16 KB httpd task stack. */
 #define IDL0_OTA_CHUNK 8192
 
+/* T06: recv_wait_timeout is 30 s (hcfg below). A client that stalls
+ * without sending FIN/RST would otherwise have its HTTPD_SOCK_ERR_TIMEOUT
+ * retried forever, wedging the single httpd worker so no other endpoint
+ * can be served and httpd_stop() can never join it. Abort after this many
+ * *consecutive* timeouts — 3 * 30 s = 90 s stalled — rather than on the
+ * first one, since a single slow-but-alive chunk is normal under load. */
+#define IDL0_OTA_MAX_CONSEC_TIMEOUTS 3
+
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
     touch_http_activity();
-    int total = req->content_len;
-    ESP_LOGI(TAG, "/ota begin, announced size=%d", total);
 
-    idl0_ota_session_t *s = idl0_ota_begin(total > 0 ? (size_t)total : 0);
+    /* size_t, not int (T35): an announced Content-Length >= 2^31 wrapped
+     * negative here, which silently disabled both the partition-size
+     * precheck below and the short-upload guard further down (a negative
+     * `total` fails every `total > 0` check they depend on). 0 means
+     * "unknown/absent" (chunked transfer, or no Content-Length header),
+     * matching the existing total>0 checks. */
+    size_t total = (req->content_len > 0) ? (size_t)req->content_len : 0;
+    ESP_LOGI(TAG, "/ota begin, announced size=%lu bytes", (unsigned long)total);
+
+    if (total > 0) {
+        const esp_partition_t *next = esp_ota_get_next_update_partition(NULL);
+        /* next==NULL: no OTA slot available at all — let idl0_ota_begin's
+         * own NULL check below report that instead of duplicating it. */
+        if (next != NULL && total > next->size) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image too large");
+            return ESP_FAIL;
+        }
+    }
+
+    idl0_ota_session_t *s = idl0_ota_begin(total);
     if (s == NULL) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin failed");
         return ESP_FAIL;
@@ -374,17 +417,28 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    int received = 0;
-    while (total < 0 || received < total) {
+    int consec_timeouts = 0;
+    size_t received = 0;
+    while (total == 0 || received < total) {
         int n = httpd_req_recv(req, buf, IDL0_OTA_CHUNK);
         if (n == 0) break;                          /* EOF (chunked) */
-        if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;  /* benign retry */
+        if (n == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++consec_timeouts >= IDL0_OTA_MAX_CONSEC_TIMEOUTS) {
+                free(buf);
+                idl0_ota_abort(s);  /* releases the OTA handle */
+                httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
+                                    "upload stalled");
+                return ESP_FAIL;
+            }
+            continue;  /* benign retry */
+        }
         if (n < 0) {
             free(buf);
             idl0_ota_abort(s);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
             return ESP_FAIL;
         }
+        consec_timeouts = 0;  /* any successful recv resets the streak */
         if (!idl0_ota_write(s, buf, (size_t)n)) {
             free(buf);
             idl0_ota_abort(s);
@@ -394,7 +448,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         /* A slow OTA upload is activity — same rationale as /download:
          * don't let the no-HTTP failsafe arm fire mid-stream. */
         touch_http_activity();
-        received += n;
+        received += (size_t)n;
     }
     free(buf);
 
@@ -475,10 +529,11 @@ static esp_err_t handoff_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* One-shot timer for the deferred AP teardown requested by POST
- * /wifi_off. Runs in the esp_timer task — NOT the httpd task — because
- * httpd_stop() joins the httpd task and would deadlock if called from a
- * handler. Created lazily, reused across WiFi sessions. */
+/* One-shot timer for deferred AP teardown, shared by POST /wifi_off and
+ * idl0_wifi_stop_deferred() (T11). Runs in the esp_timer task — NOT the
+ * httpd task, and NOT the BLE/NimBLE host task — because httpd_stop()
+ * joins the httpd task and would deadlock/stall its caller if invoked
+ * directly from either. Created lazily, reused across WiFi sessions. */
 static esp_timer_handle_t s_wifi_off_timer = NULL;
 
 static void wifi_off_timer_cb(void *arg)
@@ -490,6 +545,51 @@ static void wifi_off_timer_cb(void *arg)
     idl0_status_publish();
 }
 
+/* Creates s_wifi_off_timer on first use and (re-)arms it for a callback
+ * 500 ms out. Single implementation shared by POST /wifi_off and
+ * idl0_wifi_stop_deferred() so there is exactly one deferred-stop path
+ * (T11) — not two copies of the same timer dance.
+ *
+ * Idempotence: esp_timer_start_once() on a one-shot timer that is
+ * already armed returns ESP_ERR_INVALID_STATE without re-arming or
+ * re-queuing it, so two stops queued back-to-back (e.g. BLE
+ * CMD_WIFI_OFF racing a POST /wifi_off, or either one arriving twice)
+ * collapse onto the single pending callback — treated here as success,
+ * not an error. idl0_wifi_stop() itself is also idempotent (it
+ * short-circuits when already IDL0_WIFI_OFF), so even a spurious extra
+ * fire of the callback is a no-op. Returns the real error only if timer
+ * creation or the first arm fails. */
+static esp_err_t arm_wifi_off_timer(void)
+{
+    if (s_wifi_off_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = wifi_off_timer_cb,
+            .name     = "wifi_off",
+        };
+        esp_err_t err = esp_timer_create(&args, &s_wifi_off_timer);
+        if (err != ESP_OK) return err;
+    }
+    esp_err_t err = esp_timer_start_once(s_wifi_off_timer, 500 * 1000);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    return ESP_OK;
+}
+
+/* T11: defers idl0_wifi_stop() to the esp_timer task instead of running
+ * it on the caller's task. main.c's IDL0_CMD_WIFI_OFF case calls this
+ * from the NimBLE host task, where a direct idl0_wifi_stop() would block
+ * on httpd_stop() joining the httpd worker — stalling ALL BLE command
+ * processing for however long an in-flight handler (large /download, a
+ * stalled /ota) takes to finish. See arm_wifi_off_timer() for the
+ * idempotence guarantee covering repeated/racing calls. */
+void idl0_wifi_stop_deferred(void)
+{
+    esp_err_t err = arm_wifi_off_timer();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "idl0_wifi_stop_deferred: timer arm failed: %s",
+                 esp_err_to_name(err));
+    }
+}
+
 /* POST /wifi_off — exits WiFi mode over HTTP; the normal exit path once
  * BLE is off (SPEC §6.1, §10.4). The 500 ms delay lets the 200 flush
  * before the AP drops (same pattern as /config's reboot). */
@@ -497,21 +597,14 @@ static esp_err_t wifi_off_post_handler(httpd_req_t *req)
 {
     touch_http_activity();
 
-    if (s_wifi_off_timer == NULL) {
-        const esp_timer_create_args_t args = {
-            .callback = wifi_off_timer_cb,
-            .name     = "wifi_off",
-        };
-        if (esp_timer_create(&args, &s_wifi_off_timer) != ESP_OK) {
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
-                                "timer create failed");
-            return ESP_FAIL;
-        }
+    if (arm_wifi_off_timer() != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                            "timer create failed");
+        return ESP_FAIL;
     }
 
     httpd_resp_sendstr(req, "ok");
     ESP_LOGI(TAG, "/wifi_off - AP teardown in 500 ms");
-    esp_timer_start_once(s_wifi_off_timer, 500 * 1000);
     return ESP_OK;
 }
 
@@ -684,6 +777,14 @@ bool idl0_wifi_start(void)
      * several seconds. The 5 s default trips during normal uploads. */
     hcfg.recv_wait_timeout = 30;
     hcfg.send_wait_timeout = 30;
+    /* Without lru_purge_enable, half-open sockets (client vanished
+     * without FIN/RST) accumulate up to max_open_sockets and every new
+     * connection — including the app's own reconnect — is then refused
+     * until one times out on its own. LRU-evict the stalest instead so a
+     * fresh connection always wins. 4 sockets bounds memory (each socket
+     * backs a receive buffer) while covering handoff + reconnect. */
+    hcfg.lru_purge_enable  = true;
+    hcfg.max_open_sockets  = 4;
     err = httpd_start(&s_httpd, &hcfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(err));

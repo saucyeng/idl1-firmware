@@ -31,3 +31,12 @@ bool idl0_wifi_start(void);
 
 /* Stop the HTTP server and the AP. Idempotent. */
 bool idl0_wifi_stop(void);
+
+/* Defers idl0_wifi_stop() to a one-shot esp_timer (500 ms out) instead of
+ * running it on the caller's task — for callers that must not block on
+ * httpd_stop() joining the httpd worker task (T11), e.g. a BLE command
+ * callback running on the NimBLE host task. Shares its timer with the
+ * POST /wifi_off handler and is likewise idempotent: queuing a second
+ * deferred stop while one is already pending is a no-op (see
+ * arm_wifi_off_timer() in wifi_server.c). */
+void idl0_wifi_stop_deferred(void);

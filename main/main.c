@@ -56,7 +56,16 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
             break;
         case IDL0_CMD_WIFI_OFF:
             ESP_LOGI(TAG, "command: WIFI_OFF");
-            idl0_wifi_stop();
+            /* T11: this callback runs on the NimBLE host task. A direct
+             * idl0_wifi_stop() blocks it on httpd_stop() joining the
+             * httpd worker for as long as any in-flight handler takes,
+             * wedging all BLE processing meanwhile — defer it instead
+             * (same timer machinery as POST /wifi_off). The ack stays
+             * IDL0_ACK_OK: the stop is committed, just asynchronous —
+             * idl0_wifi_stop_deferred() cannot fail in a way the caller
+             * needs to see (it logs and no-ops on the rare timer-arm
+             * error, matching idl0_wifi_stop's own idempotence). */
+            idl0_wifi_stop_deferred();
             break;
         case IDL0_CMD_CALIBRATE_IMU:
             ESP_LOGI(TAG, "command: CALIBRATE_IMU (no-op until IMU bring-up)");
