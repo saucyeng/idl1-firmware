@@ -58,6 +58,11 @@ bool        hrm_task_has_battery(void);
  * writer rejected since the last hrm_task_diag_reset() call. Units: count. */
 uint32_t hrm_task_diag_writer_drops(void);
 
-/* Zero the writer-drop counter. Called by the session layer at
- * idl0_session_start(). */
+/* Diagnostic accessor (T23): count of control-plane events (EV_SCAN_MATCH,
+ * EV_CONNECTED, …) the NimBLE GAP/GATT callbacks dropped because the event
+ * queue was full, since the last hrm_task_diag_reset() call. Units: count. */
+uint32_t hrm_task_diag_event_drops(void);
+
+/* Zero the writer-drop and event-drop counters. Called by the session layer
+ * at idl0_session_start(). */
 void hrm_task_diag_reset(void);

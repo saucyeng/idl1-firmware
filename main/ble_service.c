@@ -589,17 +589,27 @@ void idl0_ble_publish_status(const char *status_string)
     }
     /* Cache for the next READ of the status characteristic. T12: the copy +
      * NUL write must be atomic w.r.t. status_access_cb's read, or a GATT
-     * READ landing mid-strncpy sees a spliced/unterminated buffer. */
+     * READ landing mid-strncpy sees a spliced/unterminated buffer.
+     *
+     * Also snapshot into a stack-local under the same critical section so
+     * the notify built below reads a consistent copy: idl0_ble_publish_status
+     * can be called from more than one task (1 Hz status timer, command
+     * handlers), so a second publisher's strncpy can otherwise land on
+     * s_status between this function releasing the mux and
+     * ble_hs_mbuf_from_flat() reading it, tearing the notify payload.
+     * Mirrors status_access_cb's copy-under-mux pattern. */
+    char status_copy[sizeof(s_status)];
     portENTER_CRITICAL(&s_status_mux);
     strncpy(s_status, status_string, sizeof(s_status) - 1);
     s_status[sizeof(s_status) - 1] = '\0';
+    memcpy(status_copy, s_status, sizeof(status_copy));
     portEXIT_CRITICAL(&s_status_mux);
 
     /* Notify the connected central, if any. */
     if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         return;
     }
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(s_status, strlen(s_status));
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(status_copy, strlen(status_copy));
     if (om == NULL) {
         ESP_LOGE(TAG, "status notify: mbuf alloc failed");
         return;

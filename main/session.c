@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 
 #include "ble_service.h"
 #include "device_id.h"
@@ -35,6 +36,14 @@ static const char *TAG = "session";
 
 static bool s_running = false;
 static bool s_first_fix_anchored = false;
+
+/* Guards the s_running test-and-clear at the top of idl0_session_stop().
+ * The 1 Hz status tick (esp_timer task, status.c publish_timer_cb) and a
+ * BLE STOP_LOGGING command (NimBLE host task) can both observe s_running
+ * true and call idl0_session_stop() back to back; without an atomic
+ * test-and-clear both can pass the "already stopped?" check and interleave
+ * through the drain/close/diag-log sequence below. */
+static portMUX_TYPE s_running_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool idl0_session_is_running(void) { return s_running; }
 
@@ -250,6 +259,27 @@ bool idl0_session_start(void)
         return false;
     }
 
+    /* Fault flag + per-session diag counters must all be clear BEFORE the
+     * session becomes visible (s_running=true) to the 1 Hz fault tick
+     * (status.c publish_timer_cb, esp_timer task). That tick checks
+     * idl0_writer_sd_fault() && idl0_session_is_running() and calls
+     * idl0_session_stop() on a true fault — if it preempts this function
+     * after s_running flips true but before idl0_writer_clear_sd_fault()
+     * runs, a stale fault from a previous faulted session reads as "fault
+     * now" and the tick stops the just-started session mid-start, stranding
+     * the mode bit and LED. Doing this before digital_task_start() and
+     * s_running=true also closes the ISR-attach-before-diag-reset window
+     * (an earlier review finding): nothing can touch digital_task's ISR
+     * state before its diag counters are zeroed. */
+    idl0_imu_diag_reset();   /* zero the per-session drain stats */
+    /* Zero the per-session writer-drop / append-failure counters (T05/T08/
+     * T21) so the session-end summary below reflects only this session. */
+    idl0_writer_diag_reset();
+    idl0_writer_clear_sd_fault();  /* T04: fresh session starts fault-free */
+    gps_task_diag_reset();
+    hrm_task_diag_reset();
+    digital_task_diag_reset();
+
     /* T10: start the marker-button GPIO reader (queue/task/ISR allocation)
      * BEFORE s_running flips true. Other tasks treat s_running==true as
      * "logging active" and start touching digital_task state; allocating
@@ -263,14 +293,6 @@ bool idl0_session_start(void)
 
     s_running = true;
     s_first_fix_anchored = false;
-    idl0_imu_diag_reset();   /* zero the per-session drain stats */
-    /* Zero the per-session writer-drop / append-failure counters (T05/T08/
-     * T21) so the session-end summary below reflects only this session. */
-    idl0_writer_diag_reset();
-    idl0_writer_clear_sd_fault();  /* T04: fresh session starts fault-free */
-    gps_task_diag_reset();
-    hrm_task_diag_reset();
-    digital_task_diag_reset();
     idl0_led_set(IDL0_LED_BLINK_FAST);
     ESP_LOGI(TAG, "session started (schema v3, %u registry entries)", registry_count);
     idl0_mode_set_bits(IDL0_MODE_BIT_LOGGING_ACTIVE);
@@ -280,16 +302,25 @@ bool idl0_session_start(void)
 
 bool idl0_session_stop(void)
 {
-    if (!s_running) {
+    /* Test-and-clear under a critical section: the fault tick (esp_timer
+     * task) and a BLE STOP_LOGGING (NimBLE host task) can both call this
+     * concurrently. Without an atomic check-and-set here, both callers can
+     * observe s_running==true, both proceed past this guard, and interleave
+     * through the drain/close/diag-log sequence below (double SESSION_END
+     * submit, double sd_close, etc). Only the caller that actually flips
+     * s_running true->false continues; the other returns early. This also
+     * folds in the "stop accepting new records BEFORE submitting
+     * SESSION_END" ordering the drain below depends on — sensor tasks see
+     * s_running==false as soon as either caller wins the race. */
+    portENTER_CRITICAL(&s_running_mux);
+    bool was_running = s_running;
+    s_running = false;
+    portEXIT_CRITICAL(&s_running_mux);
+    if (!was_running) {
         ESP_LOGW(TAG, "stop: not running");
         return true;
     }
 
-    /* Stop accepting new records from sensor tasks BEFORE submitting
-     * SESSION_END so that no GPS_FIX / IMU_SAMPLE / marker press can land
-     * after it in the file. The first drain flushes any record a sensor
-     * task has already enqueued while s_running was still true. */
-    s_running = false;
     digital_task_stop();
     idl0_session_drain_or_log("SESSION_END submit");
 

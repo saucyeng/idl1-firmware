@@ -32,9 +32,30 @@ static const char *TAG = "hrm";
 
 typedef enum {
     EV_CONFIG_UPDATED,
-    EV_WIFI_BIT_UP,    /* was EV_WIFI_ON */
-    EV_WIFI_BIT_DOWN,  /* was EV_WIFI_OFF */
+    EV_WIFI_BIT_UP,      /* was EV_WIFI_ON */
+    EV_WIFI_BIT_DOWN,    /* was EV_WIFI_OFF */
+    /* T23: the four below are posted by the NimBLE GAP/GATT callbacks
+     * (NimBLE host task) instead of those callbacks mutating s_state /
+     * s_conn_handle directly. run_state_machine (hrm task) is the only
+     * place either variable is written from here on. */
+    EV_SCAN_MATCH,       /* GAP DISC matched the configured address; addr valid */
+    EV_CONNECTED,        /* GAP CONNECT succeeded; conn_handle valid */
+    EV_CONNECT_FAILED,   /* GAP connect attempt failed (ble_gap_connect() rc!=0
+                           * or a CONNECT event with nonzero status) */
+    EV_DISCONNECTED,     /* GAP DISCONNECT */
+    EV_SUBSCRIBED,       /* GATT CCCD write for HR Measurement completed OK */
 } hrm_event_t;
+
+/* Queue item. conn_handle/addr are only meaningful for the event types that
+ * document them above; other event types leave them zeroed. Carrying the
+ * NimBLE-supplied facts (not just a bare enum) lets run_state_machine do the
+ * follow-up NimBLE call (ble_gap_connect / start_service_discovery) itself,
+ * on the hrm task, instead of splitting it across two tasks. */
+typedef struct {
+    hrm_event_t type;
+    uint16_t    conn_handle;  /* valid for EV_CONNECTED */
+    ble_addr_t  addr;         /* valid for EV_SCAN_MATCH */
+} hrm_event_msg_t;
 
 static QueueHandle_t s_event_queue = NULL;
 static TaskHandle_t  s_task        = NULL;
@@ -52,6 +73,12 @@ static uint16_t      s_conn_handle = 0xFFFF;
  * uint32_t — single-core chip, increment-only diagnostics. */
 static uint32_t      s_diag_writer_drops;
 
+/* T23 diag: control-plane events (EV_SCAN_MATCH/EV_CONNECTED/…) the NimBLE
+ * callbacks dropped because s_event_queue was full — hrm_task fell behind.
+ * Same increment-only pattern as s_diag_writer_drops; no log on the drop
+ * path (see post_event()). */
+static uint32_t      s_diag_event_drops;
+
 /* Standard HRS / Battery Service UUIDs. */
 #define HR_SVC_UUID16       0x180D
 #define HR_MEAS_CHR_UUID16  0x2A37
@@ -60,9 +87,10 @@ static uint32_t      s_diag_writer_drops;
 
 static uint16_t s_hr_meas_val_handle = 0;
 
-static void run_state_machine(hrm_event_t ev);
+static void run_state_machine(const hrm_event_msg_t *msg);
 static void start_scan(void);
 static int  hrm_gap_event_cb(struct ble_gap_event *event, void *arg);
+static void post_event(hrm_event_t type, uint16_t conn_handle, const ble_addr_t *addr);
 
 static void start_service_discovery(uint16_t conn_handle);
 /* Phase 3.3 fills this in. */
@@ -81,6 +109,25 @@ static bool wait_for_ble_sync(uint32_t max_ms)
         waited += step;
     }
     return true;
+}
+
+/* T23: non-blocking post from NimBLE GAP/GATT callback context (NimBLE host
+ * task) into the queue run_state_machine (hrm task) drains. 0 timeout: these
+ * callbacks can run during an active session and must not block (same rule
+ * as sensor/writer tasks) — a full queue means hrm_task has fallen behind,
+ * so the event is dropped and counted (s_diag_event_drops) rather than the
+ * callback stalling. No log here either — see the same reasoning. addr may
+ * be NULL for event types that don't carry one. */
+static void post_event(hrm_event_t type, uint16_t conn_handle, const ble_addr_t *addr)
+{
+    if (s_event_queue == NULL) return;
+    hrm_event_msg_t msg = { .type = type, .conn_handle = conn_handle };
+    if (addr != NULL) {
+        msg.addr = *addr;
+    }
+    if (xQueueSend(s_event_queue, &msg, 0) != pdTRUE) {
+        s_diag_event_drops++;
+    }
 }
 
 static void start_scan(void)
@@ -114,52 +161,41 @@ static int hrm_gap_event_cb(struct ble_gap_event *event, void *arg)
     (void)arg;
     switch (event->type) {
         case BLE_GAP_EVENT_DISC: {
+            /* s_config.address is written once at hrm_task_start(), before
+             * this task/queue exist and before scanning can produce a DISC
+             * event — effectively read-only for the life of the scan, so
+             * this cross-task read is benign (no hot-reload path writes it
+             * while a scan is active). */
             if (memcmp(event->disc.addr.val, s_config.address, HRM_ADDRESS_LEN) != 0) {
                 return 0;
             }
             ESP_LOGI(TAG, "found target HRM; connecting");
+            /* Cancelling discovery is a NimBLE control call, not a write to
+             * s_state/s_conn_handle — safe to do here immediately, same as
+             * before. T23: the actual connect attempt (and the CONNECTING/
+             * SCANNING transition around it) moves to run_state_machine so
+             * s_state has one writer; we hand it the matched address since
+             * event->disc.addr is only valid for this callback invocation. */
             (void)ble_gap_disc_cancel();
-            s_state = HRM_STATE_CONNECTING;
-            struct ble_gap_conn_params cp = {
-                .scan_itvl = 0x10,
-                .scan_window = 0x10,
-                .itvl_min = 24,   /* 30 ms — dual-conn safe minimum */
-                .itvl_max = 40,   /* 50 ms */
-                .latency = 0,
-                .supervision_timeout = 0x100,  /* 2.56 s */
-                .min_ce_len = 0,
-                .max_ce_len = 0,
-            };
-            int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &event->disc.addr,
-                                     30000, &cp, hrm_gap_event_cb, NULL);
-            if (rc != 0) {
-                ESP_LOGW(TAG, "ble_gap_connect rc=%d; rescanning", rc);
-                s_state = HRM_STATE_SCANNING;
-                start_scan();
-            }
+            post_event(EV_SCAN_MATCH, 0, &event->disc.addr);
             return 0;
         }
         case BLE_GAP_EVENT_CONNECT:
             if (event->connect.status == 0) {
-                s_conn_handle = event->connect.conn_handle;
-                s_state = HRM_STATE_DISCOVERING;
-                start_service_discovery(s_conn_handle);
+                post_event(EV_CONNECTED, event->connect.conn_handle, NULL);
             } else {
                 ESP_LOGW(TAG, "connect failed status=%d; rescanning",
                          event->connect.status);
-                s_state = HRM_STATE_SCANNING;
-                start_scan();
+                post_event(EV_CONNECT_FAILED, 0, NULL);
             }
             return 0;
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGW(TAG, "disconnect reason=%d", event->disconnect.reason);
-            s_conn_handle = 0xFFFF;
+            /* s_has_battery is battery/data-plane state (like s_latest_bpm,
+             * s_no_contact — T52, out of T23's scope), not part of the
+             * connect/scan state machine; left here unchanged. */
             s_has_battery = false;
-            if (s_state != HRM_STATE_SUSPENDED && s_config.enabled) {
-                s_state = HRM_STATE_SCANNING;
-                start_scan();
-            }
-            idl0_status_publish();
+            post_event(EV_DISCONNECTED, 0, NULL);
             return 0;
         case BLE_GAP_EVENT_NOTIFY_RX:
             handle_hr_notification(event->notify_rx.om);
@@ -205,9 +241,12 @@ static int on_subscribe_complete(uint16_t conn_handle,
         ESP_LOGW(TAG, "CCCD write failed status=%d", err->status);
         return 0;
     }
-    s_state = HRM_STATE_STREAMING;
-    ESP_LOGI(TAG, "HR Measurement notifications subscribed");
-    idl0_status_publish();
+    /* T23: state transition (-> STREAMING) plus its log/status-publish move
+     * to run_state_machine via EV_SUBSCRIBED, so they happen atomically
+     * with the write on the hrm task, same as the original same-function
+     * ordering. Issuing the battery read itself is a NimBLE GATT call, not
+     * a protected-state write, so it stays here. */
+    post_event(EV_SUBSCRIBED, 0, NULL);
 
     /* One-shot battery read on connect. We don't poll — §4.5. */
     const ble_uuid_t *bat_chr = BLE_UUID16_DECLARE(BAT_LVL_CHR_UUID16);
@@ -360,22 +399,30 @@ static void hrm_task_fn(void *arg)
         /* Block on the queue for up to 250 ms so EV_CONFIG_UPDATED still
          * arrives promptly, then check the event group for a WIFI_UP
          * bit edge. The 250 ms cadence is the worst-case latency from
-         * a WiFi state change to hrm_task reacting. */
-        hrm_event_t ev;
-        if (xQueueReceive(s_event_queue, &ev, pdMS_TO_TICKS(250)) == pdTRUE) {
-            run_state_machine(ev);
+         * a WiFi state change to hrm_task reacting. (Queued NimBLE
+         * callback events — T23 — wake xQueueReceive immediately; 250 ms
+         * is only the WIFI-bit poll's worst case, not their latency.) */
+        hrm_event_msg_t msg;
+        if (xQueueReceive(s_event_queue, &msg, pdMS_TO_TICKS(250)) == pdTRUE) {
+            run_state_machine(&msg);
         }
         const bool wifi_up = (idl0_mode_get_bits() & IDL0_MODE_BIT_WIFI_UP) != 0;
         if (wifi_up != prev_wifi) {
-            run_state_machine(wifi_up ? EV_WIFI_BIT_UP : EV_WIFI_BIT_DOWN);
+            hrm_event_msg_t wifi_msg = {
+                .type = wifi_up ? EV_WIFI_BIT_UP : EV_WIFI_BIT_DOWN,
+            };
+            run_state_machine(&wifi_msg);
             prev_wifi = wifi_up;
         }
     }
 }
 
-static void run_state_machine(hrm_event_t ev)
+/* T23: the only writer of s_state / s_conn_handle. All NimBLE GAP/GATT
+ * callbacks (NimBLE host task) now post events here instead of mutating
+ * either variable themselves — see the hrm_event_t doc comments. */
+static void run_state_machine(const hrm_event_msg_t *msg)
 {
-    switch (ev) {
+    switch (msg->type) {
         case EV_CONFIG_UPDATED:
             /* First-kick path: hrm_task_start sets state=SCANNING and
              * queues this event. Also re-entered if config_updated fires
@@ -385,6 +432,62 @@ static void run_state_machine(hrm_event_t ev)
                 s_state = HRM_STATE_SCANNING;
                 start_scan();
             }
+            break;
+
+        case EV_SCAN_MATCH: {
+            /* T23: this used to run inline in the DISC callback. Moved
+             * here so the CONNECTING/SCANNING transition around the
+             * connect attempt only ever happens on the hrm task; the
+             * matched address travels in msg->addr since the NimBLE
+             * event's own copy is only valid for the callback's duration. */
+            s_state = HRM_STATE_CONNECTING;
+            struct ble_gap_conn_params cp = {
+                .scan_itvl = 0x10,
+                .scan_window = 0x10,
+                .itvl_min = 24,   /* 30 ms — dual-conn safe minimum */
+                .itvl_max = 40,   /* 50 ms */
+                .latency = 0,
+                .supervision_timeout = 0x100,  /* 2.56 s */
+                .min_ce_len = 0,
+                .max_ce_len = 0,
+            };
+            int rc = ble_gap_connect(BLE_OWN_ADDR_PUBLIC, &msg->addr,
+                                     30000, &cp, hrm_gap_event_cb, NULL);
+            if (rc != 0) {
+                ESP_LOGW(TAG, "ble_gap_connect rc=%d; rescanning", rc);
+                s_state = HRM_STATE_SCANNING;
+                start_scan();
+            }
+            break;
+        }
+
+        case EV_CONNECTED:
+            s_conn_handle = msg->conn_handle;
+            s_state = HRM_STATE_DISCOVERING;
+            start_service_discovery(s_conn_handle);
+            break;
+
+        case EV_CONNECT_FAILED:
+            /* CONNECT event landed with a nonzero status; the "connect
+             * failed status=%d; rescanning" log already fired in the
+             * callback where event->connect.status was available. */
+            s_state = HRM_STATE_SCANNING;
+            start_scan();
+            break;
+
+        case EV_DISCONNECTED:
+            s_conn_handle = 0xFFFF;
+            if (s_state != HRM_STATE_SUSPENDED && s_config.enabled) {
+                s_state = HRM_STATE_SCANNING;
+                start_scan();
+            }
+            idl0_status_publish();
+            break;
+
+        case EV_SUBSCRIBED:
+            s_state = HRM_STATE_STREAMING;
+            ESP_LOGI(TAG, "HR Measurement notifications subscribed");
+            idl0_status_publish();
             break;
 
         case EV_WIFI_BIT_UP:
@@ -431,7 +534,7 @@ void hrm_task_start(const hrm_config_t *config)
         return;
     }
     if (s_event_queue == NULL) {
-        s_event_queue = xQueueCreate(8, sizeof(hrm_event_t));
+        s_event_queue = xQueueCreate(8, sizeof(hrm_event_msg_t));
         if (s_event_queue == NULL) {
             ESP_LOGE(TAG, "queue create failed");
             return;
@@ -446,7 +549,7 @@ void hrm_task_start(const hrm_config_t *config)
         }
     }
     s_state = HRM_STATE_SCANNING;
-    hrm_event_t kick = EV_CONFIG_UPDATED;
+    hrm_event_msg_t kick = { .type = EV_CONFIG_UPDATED };
     (void)xQueueSend(s_event_queue, &kick, 0);
     ESP_LOGI(TAG, "HRM task started; target name=\"%s\"", s_config.name);
 }
@@ -471,4 +574,5 @@ uint8_t     hrm_task_battery_pct(void) { return s_battery_pct; }
 bool        hrm_task_has_battery(void) { return s_has_battery; }
 
 uint32_t hrm_task_diag_writer_drops(void) { return s_diag_writer_drops; }
-void     hrm_task_diag_reset(void)        { s_diag_writer_drops = 0; }
+uint32_t hrm_task_diag_event_drops(void)  { return s_diag_event_drops; }
+void     hrm_task_diag_reset(void)        { s_diag_writer_drops = 0; s_diag_event_drops = 0; }
