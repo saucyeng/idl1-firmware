@@ -47,6 +47,11 @@ static bool          s_has_battery = false;
 
 static uint16_t      s_conn_handle = 0xFFFF;
 
+/* T21 diag: HR_BPM/HR_RR CHANNEL_SAMPLE records the writer rejected (ring
+ * buffer full), counted so a dropped HR/RR sample leaves a trace. Plain
+ * uint32_t — single-core chip, increment-only diagnostics. */
+static uint32_t      s_diag_writer_drops;
+
 /* Standard HRS / Battery Service UUIDs. */
 #define HR_SVC_UUID16       0x180D
 #define HR_MEAS_CHR_UUID16  0x2A37
@@ -265,7 +270,9 @@ static void submit_channel_sample(uint8_t channel_id, int64_t timestamp_us,
     size_t n = idl0_format_channel_sample(buf, channel_id, timestamp_us,
                                           value, value_len);
     if (n == 0) return;
-    (void)idl0_writer_submit(buf, n);
+    if (!idl0_writer_submit(buf, n)) {
+        s_diag_writer_drops++;   /* T21 — no log on the path; see hrm_task_diag_writer_drops() */
+    }
 }
 
 /* Parse one HR Measurement notification per the BLE HRS spec:
@@ -462,3 +469,6 @@ uint8_t     hrm_task_latest_bpm(void)  { return s_latest_bpm; }
 bool        hrm_task_no_contact(void)  { return s_no_contact; }
 uint8_t     hrm_task_battery_pct(void) { return s_battery_pct; }
 bool        hrm_task_has_battery(void) { return s_has_battery; }
+
+uint32_t hrm_task_diag_writer_drops(void) { return s_diag_writer_drops; }
+void     hrm_task_diag_reset(void)        { s_diag_writer_drops = 0; }

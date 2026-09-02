@@ -53,3 +53,11 @@ uint8_t     hrm_task_latest_bpm(void);
 bool        hrm_task_no_contact(void);
 uint8_t     hrm_task_battery_pct(void);
 bool        hrm_task_has_battery(void);
+
+/* Diagnostic accessor (T21): count of HR_BPM/HR_RR CHANNEL_SAMPLE records the
+ * writer rejected since the last hrm_task_diag_reset() call. Units: count. */
+uint32_t hrm_task_diag_writer_drops(void);
+
+/* Zero the writer-drop counter. Called by the session layer at
+ * idl0_session_start(). */
+void hrm_task_diag_reset(void);

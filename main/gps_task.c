@@ -29,6 +29,12 @@ static TaskHandle_t s_task         = NULL;
 static int64_t      s_last_fix_us  = 0;  /* esp_timer at last valid RMC */
 static bool         s_have_fix     = false;
 
+/* T08 diag: GPS_FIX records the writer rejected (ring buffer full), counted
+ * not logged — mirrors imu_task's s_diag_writer_drops: a per-drop ESP_LOGW
+ * on this task's NMEA-parsing path would run during the session it reports
+ * on. Plain uint32_t — single-core chip, increment-only diagnostics. */
+static uint32_t s_diag_writer_drops;
+
 static void emit_fix(const idl0_gps_fix_t *fix)
 {
     uint8_t buf[40];
@@ -43,7 +49,7 @@ static void emit_fix(const idl0_gps_fix_t *fix)
                                    fix->fix_quality,
                                    fix->satellites);
     if (!idl0_writer_submit(buf, n)) {
-        ESP_LOGW(TAG, "writer dropped GPS_FIX");
+        s_diag_writer_drops++;
     }
 
     /* First-fix anchor: rename the session file. Idempotent inside the
@@ -123,8 +129,13 @@ static void gps_task_fn(void *arg)
             s_have_fix = false;
             idl0_gps_force_state(IDL0_GPS_NOFIX);
             idl0_status_publish();
-            ESP_LOGW(TAG, "GPS lock lost (no valid RMC for > %lld ms)",
-                     (long long)(IDL0_GPS_LOST_LOCK_US / 1000));
+            /* T08 — the state transition always happens; only the ESP_LOGW is
+             * gated off the logging path (this task also runs outside a
+             * session, where the log is still useful). */
+            if (!idl0_session_is_running()) {
+                ESP_LOGW(TAG, "GPS lock lost (no valid RMC for > %lld ms)",
+                         (long long)(IDL0_GPS_LOST_LOCK_US / 1000));
+            }
         }
     }
 }
@@ -146,4 +157,14 @@ bool idl0_gps_task_start(void)
     }
     ESP_LOGI(TAG, "GPS task up");
     return true;
+}
+
+uint32_t gps_task_diag_writer_drops(void)
+{
+    return s_diag_writer_drops;
+}
+
+void gps_task_diag_reset(void)
+{
+    s_diag_writer_drops = 0;
 }

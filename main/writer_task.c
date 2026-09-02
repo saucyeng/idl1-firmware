@@ -17,6 +17,13 @@ static const char *TAG = "writer";
 static RingbufHandle_t s_rb   = NULL;
 static TaskHandle_t    s_task = NULL;
 
+/* T05 diag: idl0_sd_append failures, counted not logged per-item — the writer
+ * is the sole consumer draining at producer batch rate (~20 ms); a per-item
+ * ESP_LOGW would throttle the pipeline during the very failure it reports.
+ * Plain uint32_t — single-core chip, increment-only diagnostics. */
+static uint32_t s_append_fail_count;
+static bool     s_append_fail_logged;  /* true once ESP_LOGW fired for this failing run */
+
 static void writer_task_fn(void *arg)
 {
     (void)arg;
@@ -25,8 +32,19 @@ static void writer_task_fn(void *arg)
         size_t item_size = 0;
         void *item = xRingbufferReceive(s_rb, &item_size, pdMS_TO_TICKS(100));
         if (item != NULL) {
-            if (!idl0_sd_append((const uint8_t *)item, item_size)) {
-                ESP_LOGW(TAG, "append failed (%u bytes)", (unsigned)item_size);
+            if (idl0_sd_append((const uint8_t *)item, item_size)) {
+                s_append_fail_logged = false;
+            } else {
+                s_append_fail_count++;
+                if (!s_append_fail_logged) {
+                    /* One ESP_LOGW per transition into the failing state, not
+                     * per failed append (T05) — the running total reaches the
+                     * session-end diag summary via
+                     * idl0_writer_diag_append_failures(). */
+                    ESP_LOGW(TAG, "append failing (%u bytes) — further failures counted silently",
+                             (unsigned)item_size);
+                    s_append_fail_logged = true;
+                }
             }
             vRingbufferReturnItem(s_rb, item);
         }
@@ -97,4 +115,15 @@ bool idl0_writer_drain(uint32_t timeout_ms)
     }
     ESP_LOGW(TAG, "drain timeout (%u ms) — items still queued", (unsigned)timeout_ms);
     return false;
+}
+
+uint32_t idl0_writer_diag_append_failures(void)
+{
+    return s_append_fail_count;
+}
+
+void idl0_writer_diag_reset(void)
+{
+    s_append_fail_count  = 0;
+    s_append_fail_logged = false;
 }

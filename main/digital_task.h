@@ -33,3 +33,11 @@ void digital_task_start(const digital_channel_cfg_t *channels, size_t count);
 
 /* Stop the task and detach all installed ISRs. */
 void digital_task_stop(void);
+
+/* Diagnostic accessor (T21): count of marker CHANNEL_SAMPLE records the
+ * writer rejected since the last digital_task_diag_reset() call. Units: count. */
+uint32_t digital_task_diag_writer_drops(void);
+
+/* Zero the writer-drop counter. Called by the session layer at
+ * idl0_session_start(). */
+void digital_task_diag_reset(void);

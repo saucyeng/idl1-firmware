@@ -10,7 +10,16 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Brings up the UART (via idl0_gps_init) and starts the reader task.
  * Idempotent. */
 bool idl0_gps_task_start(void);
+
+/* Diagnostic accessor (T08): count of GPS_FIX records the writer rejected
+ * since the last gps_task_diag_reset() call. Units: count. */
+uint32_t gps_task_diag_writer_drops(void);
+
+/* Zero the writer-drop counter. Called by the session layer at
+ * idl0_session_start(). */
+void gps_task_diag_reset(void);

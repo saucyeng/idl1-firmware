@@ -22,10 +22,19 @@
 /* Create the ring buffer and start the writer task. Idempotent. */
 bool idl0_writer_init(void);
 
-/* Submit a fully-framed record. Drops on backpressure (returns false)
- * — sensor producers are expected to log+continue on drop. */
+/* Submit a fully-framed record. Drops on backpressure (returns false) —
+ * sensor producers are expected to count+continue on drop (no per-drop log
+ * on the logging path; see each producer's own diag-drop accessor). */
 bool idl0_writer_submit(const uint8_t *buf, size_t len);
 
 /* Block up to `timeout_ms` for the buffer to drain. Returns true if
  * empty, false on timeout. */
 bool idl0_writer_drain(uint32_t timeout_ms);
+
+/* Diagnostic accessor (T05): count of idl0_sd_append failures since the last
+ * idl0_writer_diag_reset() call. Units: count (failed appends). */
+uint32_t idl0_writer_diag_append_failures(void);
+
+/* Zero the append-failure counter. Called by the session layer at
+ * idl0_session_start() so each session's summary starts from zero. */
+void idl0_writer_diag_reset(void);

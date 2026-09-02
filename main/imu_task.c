@@ -295,8 +295,14 @@ static void imu_task_fn(void *arg)
         }
         prev_cycle_us = cycle_start_us;
 
+        /* T07 — this task drains three IMU FIFOs every 20 ms; skip the ~150-
+         * char serial diag line while a session is running (the writer task
+         * is the only task that may touch the SD path during logging). The
+         * same numbers reach the SD diag summary via idl0_imu_diag_flush()
+         * at session stop — no information is lost. */
         const int64_t now_us = esp_timer_get_time();
-        if (now_us - s_diag_last_log_us >= (int64_t)IMU_DIAG_LOG_PERIOD_MS * 1000) {
+        if (!idl0_session_is_running() &&
+            now_us - s_diag_last_log_us >= (int64_t)IMU_DIAG_LOG_PERIOD_MS * 1000) {
             emit_diag_log(now_us);
         }
     }

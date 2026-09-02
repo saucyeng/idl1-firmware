@@ -26,6 +26,11 @@ static size_t  s_channel_count;
 static uint8_t s_press_counters[DIGITAL_MAX_CHANNELS];
 static int64_t s_last_press_us[DIGITAL_MAX_CHANNELS];
 
+/* T21 diag: marker CHANNEL_SAMPLE records the writer rejected (ring buffer
+ * full), counted so a dropped press leaves a trace. Plain uint32_t —
+ * single-core chip, increment-only diagnostics. */
+static uint32_t s_diag_writer_drops;
+
 static void IRAM_ATTR gpio_isr_handler(void *arg) {
     const int idx = (int)(intptr_t)arg;
     press_event_t ev = {
@@ -45,7 +50,9 @@ static void submit_press_record(uint8_t channel_id, int64_t ts_us, uint8_t value
     const size_t n = idl0_format_channel_sample(buf, channel_id, ts_us,
                                                 &value, sizeof(value));
     if (n == 0) return;
-    (void)idl0_writer_submit(buf, n);
+    if (!idl0_writer_submit(buf, n)) {
+        s_diag_writer_drops++;   /* T21 — no log on the path; see digital_task_diag_writer_drops() */
+    }
 }
 
 static void digital_task_fn(void *arg) {
@@ -63,11 +70,16 @@ static void digital_task_fn(void *arg) {
 
         /* Monotonic press counter (u8 — wraps; press order still derivable). */
         s_press_counters[ev.channel_idx]++;
+        /* T09 — this task only runs during a session; deleted (not
+         * downgraded) the per-press ESP_LOGI that used to run here.
+         * ESP_LOGD still costs a runtime tag-level check on the logging
+         * path, and a dev build with DEBUG level enabled would print it, so
+         * only removing it fully honours "zero processing while logging"
+         * (§2). Marker presses aren't traced anywhere post-session either;
+         * they're recoverable from the session file's CHANNEL_SAMPLE
+         * records if ever needed. */
         submit_press_record(ch->channel_id, ev.timestamp_us,
                             s_press_counters[ev.channel_idx]);
-        ESP_LOGI(TAG, "marker '%s' press #%u (channel %u, t=%lld us)",
-                 ch->label, s_press_counters[ev.channel_idx],
-                 ch->channel_id, ev.timestamp_us);
     }
 }
 
@@ -125,4 +137,14 @@ void digital_task_stop(void) {
         s_press_queue = NULL;
     }
     s_channel_count = 0;
+}
+
+uint32_t digital_task_diag_writer_drops(void)
+{
+    return s_diag_writer_drops;
+}
+
+void digital_task_diag_reset(void)
+{
+    s_diag_writer_drops = 0;
 }

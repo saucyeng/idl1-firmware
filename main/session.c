@@ -17,7 +17,10 @@
 
 #include "ble_service.h"
 #include "device_id.h"
+#include "digital_task.h"
 #include "gps_driver.h"
+#include "gps_task.h"
+#include "hrm_task.h"
 #include "idl0_config.h"
 #include "idl0_format.h"
 #include "imu_task.h"
@@ -223,6 +226,12 @@ bool idl0_session_start(void)
     s_running = true;
     s_first_fix_anchored = false;
     idl0_imu_diag_reset();   /* zero the per-session drain stats */
+    /* Zero the per-session writer-drop / append-failure counters (T05/T08/
+     * T21) so the session-end summary below reflects only this session. */
+    idl0_writer_diag_reset();
+    gps_task_diag_reset();
+    hrm_task_diag_reset();
+    digital_task_diag_reset();
     idl0_led_set(IDL0_LED_BLINK_FAST);
 
     /* Start the marker-button GPIO reader if any digital channels are
@@ -261,6 +270,16 @@ bool idl0_session_stop(void)
     /* Session file is closed — safe to write the drain summary to the diag log
      * now without contending with session SD writes (§1). */
     idl0_imu_diag_flush();
+
+    /* Session diag summary (T05/T08/T21) — stop path, not the logging path,
+     * so an ESP_LOGI here is fine. Surfaces the four writer-drop / append-
+     * failure counters that are silently counted (not logged) during the
+     * session itself. */
+    ESP_LOGI(TAG, "session diag: writer_append_fail=%lu gps_drops=%lu hrm_drops=%lu digital_drops=%lu",
+             (unsigned long)idl0_writer_diag_append_failures(),
+             (unsigned long)gps_task_diag_writer_drops(),
+             (unsigned long)hrm_task_diag_writer_drops(),
+             (unsigned long)digital_task_diag_writer_drops());
 
     idl0_led_set(IDL0_LED_BLINK_SLOW);
     ESP_LOGI(TAG, "session stopped");
