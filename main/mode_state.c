@@ -23,10 +23,11 @@ void idl0_mode_init(void)
 
 EventGroupHandle_t idl0_mode_event_group(void)
 {
-    if (s_group == NULL) {
-        ESP_LOGE(TAG, "mode event group not initialised — idl0_mode_init() "
-                       "missing or failed");
-    }
+    /* Review fix: this getter is called every loop iteration by the sensor
+     * tasks (gps/imu/hrm _task.c) on the active-logging path — logging here
+     * on every NULL call would flood blocking UART logs (hard rule: no new
+     * ESP_LOGx reachable while logging). idl0_mode_init() already logs once
+     * on the actual creation failure; a degraded-boot NULL is silent here. */
     return s_group;
 }
 

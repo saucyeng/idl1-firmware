@@ -21,8 +21,10 @@ void idl0_mode_init(void);
 /* Returns the global mode event group created by idl0_mode_init(). Safe to
  * call from any task PROVIDED idl0_mode_init() has already run. Does not
  * create the group itself; if idl0_mode_init() was never called (or failed),
- * logs an error and returns NULL — callers already tolerate a NULL/no-op
- * mode group during degraded boot. */
+ * silently returns NULL — this getter runs on the active-logging path (every
+ * sensor task loop iteration), so it does not log; idl0_mode_init() already
+ * logs once on the actual creation failure. Callers already tolerate a
+ * NULL/no-op mode group during degraded boot. */
 EventGroupHandle_t idl0_mode_event_group(void);
 
 /* Atomically sets the given bits in the global mode event group. */
