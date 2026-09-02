@@ -270,6 +270,17 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
 
     s_active[imu_index] = false;
 
+    /* T31 re-runs init at session start to recover a live-faulted IMU; a
+     * prior attempt may have left a device handle attached to the bus (e.g.
+     * a T29 register-config failure happens after i2c_master_bus_add_device
+     * already succeeded). Release it first so repeated init attempts don't
+     * leak a device slot — makes init idempotent w.r.t. the handle
+     * regardless of where the previous attempt failed. */
+    if (s_i2c[imu_index].dev != NULL) {
+        i2c_master_bus_rm_device(s_i2c[imu_index].dev);
+        s_i2c[imu_index].dev = NULL;
+    }
+
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = i2c_addr,

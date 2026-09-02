@@ -343,6 +343,17 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
     s_init_attempted[imu_index] = true;
     s_per_state[imu_index]      = IDL0_IMU_ABSENT;
 
+    /* T31 re-runs init at session start to recover a live-faulted IMU; a
+     * prior attempt may have left a device handle attached to the bus (e.g.
+     * a T29 register-config failure happens after spi_bus_add_device already
+     * succeeded). Release it first so repeated init attempts don't leak a
+     * device slot — makes init idempotent w.r.t. the handle regardless of
+     * where the previous attempt failed. */
+    if (s_spi[imu_index] != NULL) {
+        spi_bus_remove_device(s_spi[imu_index]);
+        s_spi[imu_index] = NULL;
+    }
+
     spi_device_interface_config_t dev = {
         .clock_speed_hz = IMU_SPI_HZ,
         .mode           = 0,                 /* CPOL=0, CPHA=0 */
