@@ -20,6 +20,57 @@ static const char *TAG = "config";
 
 #define CONFIG_MAX_BYTES 8192
 
+/* Clamp `value` to the nearest entry in `valid_set` (ascending, `count`
+ * entries). Ties round toward the lower entry. Used for every §8 field with
+ * a fixed hardware-defined set of legal values (LSM6DSO32 ODR/FS ladders) so
+ * a bogus or negative JSON number can't reach the sensor init or the on-disk
+ * registry unclamped. Logs field/given/applied on any change. */
+static int32_t clamp_to_set(const char *field, int32_t value,
+                             const int32_t *valid_set, size_t count)
+{
+    int32_t best = valid_set[0];
+    int32_t best_dist = (value > best) ? (value - best) : (best - value);
+    for (size_t i = 1; i < count; i++) {
+        int32_t v = valid_set[i];
+        int32_t dist = (value > v) ? (value - v) : (v - value);
+        if (dist < best_dist) {
+            best = v;
+            best_dist = dist;
+        }
+    }
+    if (best != value) {
+        ESP_LOGW(TAG, "%s: invalid value %ld, clamped to %ld",
+                 field, (long)value, (long)best);
+    }
+    return best;
+}
+
+/* Clamp `value` to [lo, hi] (inclusive). Used for §8 fields the spec leaves
+ * a free range rather than a fixed hardware set. Logs field/given/applied
+ * on any change. */
+static int32_t clamp_to_range(const char *field, int32_t value,
+                               int32_t lo, int32_t hi)
+{
+    int32_t clamped = (value < lo) ? lo : (value > hi ? hi : value);
+    if (clamped != value) {
+        ESP_LOGW(TAG, "%s: invalid value %ld, clamped to %ld",
+                 field, (long)value, (long)clamped);
+    }
+    return clamped;
+}
+
+/* LSM6DSO32 ODR ladder (Hz), spec §8. The sensor's true rates are
+ * 12.5/26/52/104/208/416/833/1666 Hz; JSON carries integers only, so 12.5 is
+ * represented as 12 here — 13 is NOT accepted as 12.5-intent, it clamps to
+ * the nearest listed integer like any other invalid value. */
+static const int32_t IMU_SAMPLE_RATE_SET[] = { 12, 26, 52, 104, 208, 416, 833, 1666 };
+
+/* LSM6DSO32 accelerometer full-scale set (g), spec §8. */
+static const int32_t ACCEL_RANGE_SET[] = { 4, 8, 16, 32 };
+
+/* LSM6DSO32 gyroscope full-scale set (dps), spec §8. */
+static const int32_t GYRO_RANGE_SET[] = { 125, 250, 500, 1000, 2000 };
+
 /* All-IMU, all-axis mask (bits 0-17). */
 #define DEFAULT_IMU_MASK 0x0003FFFFu
 
@@ -61,7 +112,11 @@ static void load_analog(const cJSON *root, idl0_config_t *cfg)
 
     const cJSON *rate = cJSON_GetObjectItemCaseSensitive(analog, "sample_rate_hz");
     if (cJSON_IsNumber(rate)) {
-        cfg->analog_sample_rate_hz = (uint16_t)rate->valueint;
+        /* Spec §8 leaves analog.sample_rate_hz "not yet defined"; bound it to
+         * a sane range (1-1000 Hz) rather than accepting anything, since a
+         * negative or huge value flows straight into the ADC scheduler. */
+        cfg->analog_sample_rate_hz = (uint16_t)clamp_to_range(
+            "analog.sample_rate_hz", rate->valueint, 1, 1000);
     }
 
     const cJSON *channels = cJSON_GetObjectItemCaseSensitive(analog, "channels");
@@ -141,7 +196,11 @@ static void load_digital(const cJSON *root, idl0_config_t *cfg)
         d->enabled    = cJSON_IsTrue(en);
         d->gpio_pin   = cJSON_IsNumber(pin) ? pin->valueint : -1;
         d->active_low = cJSON_IsBool(act) ? cJSON_IsTrue(act) : true;
-        d->debounce_ms = cJSON_IsNumber(db) ? (uint16_t)db->valueint : 20;
+        /* debounce_ms (ms): bound to [0, 1000] — a negative value would wrap
+         * to a huge uint16_t and effectively disable the marker input. */
+        d->debounce_ms = cJSON_IsNumber(db) ?
+            (uint16_t)clamp_to_range("digital.channels[].debounce_ms",
+                                      db->valueint, 0, 1000) : 20;
         if (cJSON_IsString(lbl) && lbl->valuestring != NULL) {
             strncpy(d->label, lbl->valuestring, sizeof(d->label) - 1);
         } else {
@@ -219,14 +278,73 @@ static uint32_t parse_imu_axes(const cJSON *imu_obj, int imu_index)
     return bits << (imu_index * 6);
 }
 
+/* Linear pre-scan of raw JSON text for excessive `[`/`{` nesting depth,
+ * before handing the buffer to cJSON's recursive-descent parser. Real §8
+ * config nests <= 5 deep; 16 is generous headroom. cJSON has its own depth
+ * limit (1000), but that check only trips after the call stack is already
+ * deep enough to overflow the 8 KB NimBLE host task stack — this catches
+ * pathological input (e.g. ~1000 nested brackets, ~2 KB) before any
+ * recursion happens. Correctly skips over string literals (quote and
+ * backslash-escape handling) so brackets inside string values don't count. */
+#define JSON_MAX_NESTING_DEPTH 16
+
+static bool json_depth_ok(const char *buf, size_t len)
+{
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+
+    for (size_t i = 0; i < len; i++) {
+        char c = buf[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '[' || c == '{') {
+            depth++;
+            if (depth > JSON_MAX_NESTING_DEPTH) {
+                return false;
+            }
+        } else if (c == ']' || c == '}') {
+            if (depth > 0) depth--;
+        }
+    }
+    return true;
+}
+
 bool idl0_config_load(idl0_config_t *out_config)
 {
     fill_defaults(out_config);
 
     FILE *f = fopen(IDL0_CONFIG_PATH, "rb");
     if (f == NULL) {
-        ESP_LOGW(TAG, "%s not found — using defaults", IDL0_CONFIG_PATH);
-        return false;
+        /* Write side is remove(live) then rename(tmp, live) — not atomic
+         * (FAT32 rename() can't overwrite an existing target, hence the
+         * remove-first dance in idl0_config_write_json()). Power loss
+         * between those two calls leaves NO live file even though the
+         * complete .tmp is still on disk, so a boot right after would
+         * silently fall back to defaults. Recover the .tmp here first. */
+        static const char *tmp_path = IDL0_CONFIG_PATH ".tmp";
+        FILE *tmp_check = fopen(tmp_path, "rb");
+        if (tmp_check != NULL) {
+            fclose(tmp_check);
+            if (rename(tmp_path, IDL0_CONFIG_PATH) == 0) {
+                ESP_LOGW(TAG, "recovered config from interrupted replace");
+                f = fopen(IDL0_CONFIG_PATH, "rb");
+            }
+        }
+        if (f == NULL) {
+            ESP_LOGW(TAG, "%s not found — using defaults", IDL0_CONFIG_PATH);
+            return false;
+        }
     }
 
     uint8_t *raw = malloc(CONFIG_MAX_BYTES);
@@ -240,6 +358,15 @@ bool idl0_config_load(idl0_config_t *out_config)
 
     /* CRC32 over the exact on-disk bytes — before any parsing (§5.1). */
     out_config->config_crc32 = idl0_format_crc32(raw, len);
+
+    /* Reject pathological nesting before it ever reaches cJSON's recursive
+     * descent parser — see json_depth_ok() above. Treated the same as a
+     * malformed-JSON file: defaults are already loaded. */
+    if (!json_depth_ok((const char *)raw, len)) {
+        free(raw);
+        ESP_LOGW(TAG, "config JSON nesting too deep — using defaults");
+        return false;
+    }
 
     cJSON *root = cJSON_ParseWithLength((const char *)raw, len);
     free(raw);
@@ -266,21 +393,30 @@ bool idl0_config_load(idl0_config_t *out_config)
     if (cJSON_IsObject(imu)) {
         const cJSON *rate = cJSON_GetObjectItemCaseSensitive(imu, "sample_rate_hz");
         if (cJSON_IsNumber(rate)) {
-            out_config->imu_sample_rate_hz = (uint16_t)rate->valueint;
+            /* LSM6DSO32 ODR ladder (Hz) — see IMU_SAMPLE_RATE_SET above for
+             * the 12.5 Hz note. */
+            out_config->imu_sample_rate_hz = (uint16_t)clamp_to_set(
+                "imu.sample_rate_hz", rate->valueint,
+                IMU_SAMPLE_RATE_SET,
+                sizeof(IMU_SAMPLE_RATE_SET) / sizeof(IMU_SAMPLE_RATE_SET[0]));
         }
 
         /* Top-level accel_range_g / gyro_range_dps seed all three slots for
          * back-compat with config files that lack per-IMU sub-blocks. */
         const cJSON *arange_top = cJSON_GetObjectItemCaseSensitive(imu, "accel_range_g");
         if (cJSON_IsNumber(arange_top)) {
-            uint8_t v = (uint8_t)arange_top->valueint;
+            uint8_t v = (uint8_t)clamp_to_set(
+                "imu.accel_range_g", arange_top->valueint,
+                ACCEL_RANGE_SET, sizeof(ACCEL_RANGE_SET) / sizeof(ACCEL_RANGE_SET[0]));
             out_config->accel_range_g[0] = v;
             out_config->accel_range_g[1] = v;
             out_config->accel_range_g[2] = v;
         }
         const cJSON *grange_top = cJSON_GetObjectItemCaseSensitive(imu, "gyro_range_dps");
         if (cJSON_IsNumber(grange_top)) {
-            uint16_t v = (uint16_t)grange_top->valueint;
+            uint16_t v = (uint16_t)clamp_to_set(
+                "imu.gyro_range_dps", grange_top->valueint,
+                GYRO_RANGE_SET, sizeof(GYRO_RANGE_SET) / sizeof(GYRO_RANGE_SET[0]));
             out_config->gyro_range_dps[0] = v;
             out_config->gyro_range_dps[1] = v;
             out_config->gyro_range_dps[2] = v;
@@ -312,11 +448,15 @@ bool idl0_config_load(idl0_config_t *out_config)
             }
             const cJSON *ar = cJSON_GetObjectItemCaseSensitive(imu_blk, "accel_range_g");
             if (cJSON_IsNumber(ar)) {
-                out_config->accel_range_g[i] = (uint8_t)ar->valueint;
+                out_config->accel_range_g[i] = (uint8_t)clamp_to_set(
+                    "imu.imuN.accel_range_g", ar->valueint,
+                    ACCEL_RANGE_SET, sizeof(ACCEL_RANGE_SET) / sizeof(ACCEL_RANGE_SET[0]));
             }
             const cJSON *gr = cJSON_GetObjectItemCaseSensitive(imu_blk, "gyro_range_dps");
             if (cJSON_IsNumber(gr)) {
-                out_config->gyro_range_dps[i] = (uint16_t)gr->valueint;
+                out_config->gyro_range_dps[i] = (uint16_t)clamp_to_set(
+                    "imu.imuN.gyro_range_dps", gr->valueint,
+                    GYRO_RANGE_SET, sizeof(GYRO_RANGE_SET) / sizeof(GYRO_RANGE_SET[0]));
             }
             const cJSON *channels_blk =
                 cJSON_GetObjectItemCaseSensitive(imu_blk, "channels");
@@ -384,6 +524,13 @@ bool idl0_config_save(const idl0_config_t *config)
 idl0_config_write_result_t idl0_config_write_json(const char *buf, size_t len)
 {
     if (buf == NULL || len == 0 || len > CONFIG_MAX_BYTES) {
+        return IDL0_CONFIG_WRITE_BAD_JSON;
+    }
+
+    /* Reject pathological nesting before it ever reaches cJSON's recursive
+     * descent parser — see json_depth_ok() above. `buf` comes from the BLE
+     * config-push path, which runs on the 8 KB NimBLE host task stack. */
+    if (!json_depth_ok(buf, len)) {
         return IDL0_CONFIG_WRITE_BAD_JSON;
     }
 
