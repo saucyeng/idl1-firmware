@@ -43,7 +43,11 @@ typedef struct {
     int16_t gyro[3];   /* X, Y, Z — raw int16 LSB */
 } idl0_imu_sample_t;
 
-/* Aggregate state — see enum doc above. */
+/* Aggregate state — see enum doc above.
+ * T32: this aggregates only the SPI driver's IMUs (IMU0). With IMU1/IMU2 on
+ * I²C (imu_driver_i2c.c) it is blind to their state — use
+ * idl0_imu_task_state() (imu_task.h) for the whole-device aggregate that
+ * status.c reports. Kept here for the SPI driver's own bookkeeping/tests. */
 idl0_imu_state_t idl0_imu_state(void);
 const char *idl0_imu_state_str(idl0_imu_state_t state);
 
@@ -51,6 +55,13 @@ const char *idl0_imu_state_str(idl0_imu_state_t state);
  * usable. False for unpopulated slots, init failures, or post-init errors.
  * Bounds-checks imu_index. */
 bool idl0_imu_is_active(uint8_t imu_index);
+
+/* Raw per-instance state (ABSENT/OK/ERROR — PARTIAL is aggregate-only,
+ * never assigned per-IMU). Lets a caller distinguish a never-populated slot
+ * (ABSENT) from one that came up and later faulted (ERROR), which
+ * idl0_imu_is_active() alone cannot. Bounds-checks imu_index (ABSENT if out
+ * of range). */
+idl0_imu_state_t idl0_imu_per_state(uint8_t imu_index);
 
 /* Initialise one IMU (by index 0..IDL0_IMU_COUNT-1) on the shared SPI
  * host: add the device with its CS pin (per pins.h), verify WHO_AM_I

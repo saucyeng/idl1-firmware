@@ -78,10 +78,6 @@ static bool                s_have_gyro[IDL0_IMU_COUNT];
 static bool                s_gyro_fresh[IDL0_IMU_COUNT];
 static uint32_t            s_reuse[IDL0_IMU_COUNT];
 static uint32_t            s_unknown[IDL0_IMU_COUNT];
-/* Count of unrecognised FIFO tag words seen since the last diag flush — a
- * corruption / unexpected-batch-word signal (0 on a clean bus). Read+cleared
- * by idl0_imu_take_unknown(). */
-static uint32_t            s_unknown[IDL0_IMU_COUNT];
 
 /* --- ST driver platform glue -------------------------------------
  *
@@ -267,6 +263,23 @@ static void diag_dump_one(uint8_t imu_index)
 
 /* --- Public API -------------------------------------------------- */
 
+/* T29: checks an ST-driver config-write's int32_t return. On failure, logs
+ * which call failed, marks this IMU ERROR (a config write failing mid-
+ * sequence otherwise leaves the chip at whatever power-on-reset ODR/FIFO
+ * mode it stopped at, while the driver still reports OK), and returns false
+ * out of the calling function. Local to idl0_imu_init_one() (needs
+ * `imu_idx` == the function's `imu_index` in scope) — a macro avoids
+ * repeating this 4-line check for all 11 register-config calls. */
+#define IMU_CFG_CHECK(imu_idx, name, call) do {                            \
+        int32_t _rc = (call);                                              \
+        if (_rc != 0) {                                                    \
+            ESP_LOGE(TAG, "IMU%u init: %s failed: rc=%ld",                 \
+                     (unsigned)(imu_idx), name, (long)_rc);                \
+            s_per_state[imu_idx] = IDL0_IMU_ERROR;                         \
+            return false;                                                  \
+        }                                                                  \
+    } while (0)
+
 const char *idl0_imu_state_str(idl0_imu_state_t state)
 {
     switch (state) {
@@ -278,6 +291,10 @@ const char *idl0_imu_state_str(idl0_imu_state_t state)
     }
 }
 
+/* T32: idl0_imu_state() below aggregates only this (SPI) driver's IMUs.
+ * With IMU1/IMU2 on I²C (imu_driver_i2c.c) it is blind to their failures —
+ * use idl0_imu_task_state() (imu_task.c) for the whole-device aggregate;
+ * this function is kept for the SPI driver's own bookkeeping / tests. */
 idl0_imu_state_t idl0_imu_state(void)
 {
     int attempted = 0, ok_count = 0, error = 0;
@@ -298,6 +315,17 @@ bool idl0_imu_is_active(uint8_t imu_index)
 {
     if (imu_index >= IDL0_IMU_COUNT) return false;
     return s_per_state[imu_index] == IDL0_IMU_OK;
+}
+
+/* T32/T31: raw per-instance state (ABSENT/OK/ERROR — PARTIAL is aggregate-
+ * only, never assigned per-IMU). Used by idl0_imu_task_state() (imu_task.c)
+ * to tell an ERROR from an ABSENT (unpopulated) slot when building the
+ * cross-bus aggregate, and by idl0_imu_task_reinit_failed() to find IMUs
+ * worth retrying at session start. Out-of-range returns ABSENT. */
+idl0_imu_state_t idl0_imu_per_state(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return IDL0_IMU_ABSENT;
+    return s_per_state[imu_index];
 }
 
 bool idl0_imu_init_one(spi_host_device_t spi_host,
@@ -346,7 +374,7 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
     }
 
     /* Software reset, then wait for it to clear. */
-    lsm6dso32x_reset_set(ctx, PROPERTY_ENABLE);
+    IMU_CFG_CHECK(imu_index, "reset_set", lsm6dso32x_reset_set(ctx, PROPERTY_ENABLE));
     uint8_t rst = 1;
     for (int i = 0; i < 10 && rst != 0; i++) {
         lsm6dso32x_reset_get(ctx, &rst);
@@ -354,33 +382,51 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
     }
 
     /* Block Data Update so register reads don't tear. */
-    lsm6dso32x_block_data_update_set(ctx, PROPERTY_ENABLE);
+    IMU_CFG_CHECK(imu_index, "block_data_update_set",
+                  lsm6dso32x_block_data_update_set(ctx, PROPERTY_ENABLE));
 
     /* Full-scale + ODR. */
-    lsm6dso32x_xl_full_scale_set(ctx, xl_fs_enum(accel_range_g));
-    lsm6dso32x_gy_full_scale_set(ctx, gy_fs_enum(gyro_range_dps));
-    lsm6dso32x_xl_data_rate_set(ctx, xl_odr_enum(sample_rate_hz));
-    lsm6dso32x_gy_data_rate_set(ctx, gy_odr_enum(sample_rate_hz));
+    IMU_CFG_CHECK(imu_index, "xl_full_scale_set",
+                  lsm6dso32x_xl_full_scale_set(ctx, xl_fs_enum(accel_range_g)));
+    IMU_CFG_CHECK(imu_index, "gy_full_scale_set",
+                  lsm6dso32x_gy_full_scale_set(ctx, gy_fs_enum(gyro_range_dps)));
+    IMU_CFG_CHECK(imu_index, "xl_data_rate_set",
+                  lsm6dso32x_xl_data_rate_set(ctx, xl_odr_enum(sample_rate_hz)));
+    IMU_CFG_CHECK(imu_index, "gy_data_rate_set",
+                  lsm6dso32x_gy_data_rate_set(ctx, gy_odr_enum(sample_rate_hz)));
 
     /* Power mode (v2.3.0 enums: LSM6DSO32X_HIGH_PERFORMANCE_MD /
      * LSM6DSO32X_LOW_NORMAL_POWER_MD for accel; LSM6DSO32X_GY_HIGH_PERFORMANCE
      * / LSM6DSO32X_GY_NORMAL for gyro). */
     if (high_performance) {
-        lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_HIGH_PERFORMANCE_MD);
-        lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_HIGH_PERFORMANCE);
+        IMU_CFG_CHECK(imu_index, "xl_power_mode_set(HP)",
+                      lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_HIGH_PERFORMANCE_MD));
+        IMU_CFG_CHECK(imu_index, "gy_power_mode_set(HP)",
+                      lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_HIGH_PERFORMANCE));
     } else {
-        lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_LOW_NORMAL_POWER_MD);
-        lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_NORMAL);
+        IMU_CFG_CHECK(imu_index, "xl_power_mode_set(LN)",
+                      lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_LOW_NORMAL_POWER_MD));
+        IMU_CFG_CHECK(imu_index, "gy_power_mode_set(LN)",
+                      lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_NORMAL));
     }
 
     /* FIFO: continuous-overwrite (STREAM), BDR = ODR for both XL and GY. */
-    lsm6dso32x_fifo_xl_batch_set(ctx, xl_bdr_enum(sample_rate_hz));
-    lsm6dso32x_fifo_gy_batch_set(ctx, gy_bdr_enum(sample_rate_hz));
-    lsm6dso32x_fifo_mode_set(ctx, LSM6DSO32X_STREAM_MODE);
+    IMU_CFG_CHECK(imu_index, "fifo_xl_batch_set",
+                  lsm6dso32x_fifo_xl_batch_set(ctx, xl_bdr_enum(sample_rate_hz)));
+    IMU_CFG_CHECK(imu_index, "fifo_gy_batch_set",
+                  lsm6dso32x_fifo_gy_batch_set(ctx, gy_bdr_enum(sample_rate_hz)));
+    IMU_CFG_CHECK(imu_index, "fifo_mode_set",
+                  lsm6dso32x_fifo_mode_set(ctx, LSM6DSO32X_STREAM_MODE));
 
     s_have_gyro[imu_index]    = false;
     s_gyro_fresh[imu_index]   = false;
     s_overrun_flag[imu_index] = false;
+    /* T31: clear the pair-builder diagnostic counters too, so a re-init
+     * (idl0_imu_task_reinit_failed(), session.c at session start) starts
+     * clean instead of carrying stale reuse/unknown counts from before the
+     * fault into the new session's diag summary. */
+    s_reuse[imu_index]        = 0;
+    s_unknown[imu_index]      = 0;
     s_per_state[imu_index]    = IDL0_IMU_OK;
     ESP_LOGI(TAG, "IMU%u up: ODR=%u Hz, AccelFS=±%ug, GyroFS=±%udps, %s",
              (unsigned)imu_index,
@@ -503,6 +549,15 @@ size_t idl0_imu_drain(uint8_t imu_index, idl0_imu_sample_t *out, size_t max_pair
 
     size_t words = level;
     if (words > IMU_SPI_BURST_MAX_WORDS) words = IMU_SPI_BURST_MAX_WORDS;
+    /* T30: also cap to max_pairs, BEFORE the burst read. The parse loop below
+     * emits at most one pair per word (worst case: every word is a lone accel
+     * reusing the pending gyro on a phase slip), so words beyond max_pairs
+     * could never yield more than max_pairs pairs anyway — but the burst read
+     * physically dequeues every word it asks for from the chip FIFO. Without
+     * this cap, a burst larger than max_pairs would dequeue words the parse
+     * loop's `n_pairs < max_pairs` check then silently discards. Capping here
+     * instead leaves that tail in the chip FIFO for the next poll. */
+    if (words > max_pairs) words = max_pairs;
     const size_t nbytes = words * 7;
 
     /* One full-duplex DMA burst from FIFO_DATA_OUT_TAG (0x78). With IF_INC=1

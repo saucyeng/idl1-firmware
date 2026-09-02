@@ -77,6 +77,17 @@ static TaskHandle_t s_task         = NULL;
 static uint16_t     s_odr_hz       = 104;
 static uint32_t     s_channel_mask = 0;
 
+/* Boot-time per-IMU config, persisted so idl0_imu_task_reinit_failed() (T31)
+ * and idl0_imu_task_state() (T32) can re-consult exactly what
+ * idl0_imu_task_start() applied, without session.c/status.c duplicating
+ * imu_task's bus map or config lookup. s_odr_hz above already holds the
+ * one (shared) sample rate; these cover what varies per IMU index. Set once
+ * in idl0_imu_task_start(); false/0 for any index the config didn't enable. */
+static bool     s_imu_enabled[IDL0_IMU_COUNT];
+static uint8_t  s_accel_range_g[IDL0_IMU_COUNT];
+static uint16_t s_gyro_range_dps[IDL0_IMU_COUNT];
+static bool     s_high_performance;
+
 /* Per-IMU counters for the periodic diagnostic log. Reset on each log emit. */
 static uint32_t s_diag_pairs[IDL0_IMU_COUNT];
 static uint32_t s_diag_overruns[IDL0_IMU_COUNT];
@@ -227,6 +238,81 @@ void idl0_imu_diag_flush(void)
                         IMU_POLL_MS, IMU_DRAIN_MAX_PAIRS);
 }
 
+/* T32: whole-device IMU aggregate — see imu_task.h doc and imu_driver.c's
+ * idl0_imu_state() for the rules this mirrors.
+ *
+ * Aggregate rules (identical to idl0_imu_state(), just walked per-bus):
+ *   - "attempted" = this index is enabled in config (s_imu_enabled[i]) —
+ *     imu_task only calls the matching init_one for enabled slots, so this
+ *     is the cross-bus equivalent of the SPI driver's own init-attempted
+ *     bookkeeping.
+ *   - SPI (idl0_imu_per_state()): OK -> ok_count++; ERROR -> error++;
+ *     ABSENT (unpopulated / never-initialised) counts toward neither.
+ *   - I²C (idl0_imu_is_active_i2c() + idl0_imu_i2c_init_attempted()): active
+ *     -> ok_count++; attempted-but-inactive -> error++. I²C has no ABSENT/
+ *     ERROR split like SPI (just active + attempted), so any attempted IMU
+ *     that isn't active counts as an error rather than a quiet ABSENT —
+ *     that is the T32 fix: a dead I²C IMU must be visible, not invisible.
+ *   - attempted == 0            -> ABSENT (nothing configured)
+ *   - error > 0                 -> ERROR  (at least one configured IMU is down)
+ *   - ok_count == 0             -> ABSENT (configured, but none ever came up)
+ *   - ok_count < attempted      -> PARTIAL (some up, some down)
+ *   - otherwise                 -> OK
+ */
+idl0_imu_state_t idl0_imu_task_state(void)
+{
+    int attempted = 0, ok_count = 0, error = 0;
+    for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+        if (!s_imu_enabled[i]) continue;
+        attempted++;
+        if (s_imu_bus[i] == IDL0_BUS_I2C) {
+            if (idl0_imu_is_active_i2c(i)) {
+                ok_count++;
+            } else if (idl0_imu_i2c_init_attempted(i)) {
+                error++;
+            }
+        } else {
+            const idl0_imu_state_t st = idl0_imu_per_state(i);
+            if (st == IDL0_IMU_OK)         ok_count++;
+            else if (st == IDL0_IMU_ERROR) error++;
+        }
+    }
+    if (attempted == 0)       return IDL0_IMU_ABSENT;
+    if (error > 0)            return IDL0_IMU_ERROR;
+    if (ok_count == 0)        return IDL0_IMU_ABSENT;
+    if (ok_count < attempted) return IDL0_IMU_PARTIAL;
+    return IDL0_IMU_OK;
+}
+
+/* T31 — see imu_task.h doc. Called from idl0_session_start() (session.c),
+ * before that session's channel registry is built. */
+void idl0_imu_task_reinit_failed(void)
+{
+    for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+        if (!s_imu_enabled[i]) continue;
+
+        if (s_imu_bus[i] == IDL0_BUS_I2C) {
+            if (idl0_imu_is_active_i2c(i)) continue;        /* already healthy */
+            if (!idl0_imu_i2c_init_attempted(i)) continue;  /* never brought up at boot — nothing to retry */
+            const bool ok = idl0_imu_init_one_i2c(
+                i, s_imu_i2c_addr[i], s_odr_hz,
+                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance);
+            ESP_LOGW(TAG, "IMU%u (I2C) re-init at session start: %s",
+                     (unsigned)i, ok ? "recovered" : "still down");
+        } else {
+            /* Only a live ERROR latch is worth retrying — ABSENT means the
+             * chip never answered WHO_AM_I at boot (unpopulated/miswired),
+             * which a re-init can't fix. */
+            if (idl0_imu_per_state(i) != IDL0_IMU_ERROR) continue;
+            const bool ok = idl0_imu_init_one(
+                SPI2_HOST, i, s_odr_hz,
+                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance);
+            ESP_LOGW(TAG, "IMU%u (SPI) re-init at session start: %s",
+                     (unsigned)i, ok ? "recovered" : "still down");
+        }
+    }
+}
+
 static void emit_diag_log(int64_t now_us)
 {
     /* Show per-IMU pair counts + overruns since last log. Lets us
@@ -323,8 +409,9 @@ bool idl0_imu_task_start(void)
     ESP_LOGI(TAG, "imu_enabled = { %d, %d, %d } (from config)",
              cfg.imu_enabled[0], cfg.imu_enabled[1], cfg.imu_enabled[2]);
 
-    s_odr_hz       = cfg.imu_sample_rate_hz;
-    s_channel_mask = cfg.imu_channel_mask;
+    s_odr_hz            = cfg.imu_sample_rate_hz;
+    s_channel_mask      = cfg.imu_channel_mask;
+    s_high_performance  = cfg.high_performance_mode;
 
     /* Initialise every IMU the config has enabled. Each call is
      * independent — a missing or unresponsive IMU does not block
@@ -333,6 +420,12 @@ bool idl0_imu_task_start(void)
     int up = 0;
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!cfg.imu_enabled[i]) continue;
+        /* T31/T32: remember this IMU's boot config so a later re-init
+         * (idl0_imu_task_reinit_failed()) or aggregate query
+         * (idl0_imu_task_state()) doesn't need cfg re-loaded. */
+        s_imu_enabled[i]    = true;
+        s_accel_range_g[i]  = cfg.accel_range_g[i];
+        s_gyro_range_dps[i] = cfg.gyro_range_dps[i];
         bool ok;
         if (s_imu_bus[i] == IDL0_BUS_I2C) {
             ok = idl0_imu_init_one_i2c(i, s_imu_i2c_addr[i],

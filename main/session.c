@@ -115,6 +115,13 @@ bool idl0_session_start(void)
     uint8_t uuid[16];
     esp_fill_random(uuid, sizeof(uuid));
 
+    /* T31: give any IMU that's been latched ERROR (SPI) / inactive-after-
+     * attempt (I²C) since boot one more init attempt before this session's
+     * channel registry (built next) locks in which axes actually get
+     * recorded — a transient bus fault earlier in the run shouldn't leave
+     * an IMU dropped out of every session for the rest of boot. */
+    idl0_imu_task_reinit_failed();
+
     /* Build the channel registry.  One entry per enabled IMU axis (mask bit
      * set); channel_id equals the bit position (0-17).  Disabled axes get no
      * entry; registry_count reflects only the entries that are present. */

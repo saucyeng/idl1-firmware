@@ -11,6 +11,7 @@
 #include "gps_driver.h"
 #include "hrm_task.h"
 #include "imu_driver.h"
+#include "imu_task.h"
 #include "ota.h"
 #include "sd_logger.h"
 #include "session.h"
@@ -64,11 +65,15 @@ void idl0_status_publish(void)
         if (add > 0) cursor += (size_t)add;
     }
 
+    /* T32: idl0_imu_task_state() (imu_task.c) aggregates both buses — SPI
+     * (IMU0) and I²C (IMU1/IMU2) — unlike idl0_imu_state() (imu_driver.c),
+     * which only sees the SPI driver and would otherwise misreport "OK"
+     * while both I²C IMUs are down. */
     if (cursor < sizeof(status)) {
         int add = snprintf(status + cursor, sizeof(status) - cursor,
                            "\nGPS: %s\nIMU: %s\nFirmware: %s",
                            idl0_gps_state_str(idl0_gps_state()),
-                           idl0_imu_state_str(idl0_imu_state()),
+                           idl0_imu_state_str(idl0_imu_task_state()),
                            esp_app_get_description()->version);
         if (add > 0) cursor += (size_t)add;
     }

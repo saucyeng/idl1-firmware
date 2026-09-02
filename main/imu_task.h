@@ -14,6 +14,8 @@
 
 #include <stdbool.h>
 
+#include "imu_driver.h"   /* idl0_imu_state_t */
+
 /* Brings up IMU0 from config and starts the polling task. Idempotent. */
 bool idl0_imu_task_start(void);
 
@@ -23,3 +25,22 @@ bool idl0_imu_task_start(void);
  * on-SD diag log — so nothing is written mid-session (§1: raw capture only). */
 void idl0_imu_diag_reset(void);
 void idl0_imu_diag_flush(void);
+
+/* T32: whole-device IMU aggregate — walks every IMU this task configured at
+ * boot (imu_task owns the bus map, s_imu_bus[]) through the correct bus's
+ * driver (SPI: imu_driver.c; I²C: imu_driver_i2c.c) and combines them with
+ * the same OK/PARTIAL/ERROR/ABSENT semantics as imu_driver.c's
+ * idl0_imu_state() (which only sees the SPI side). status.c calls this one
+ * for the §7.3 "IMU:" status token. */
+idl0_imu_state_t idl0_imu_task_state(void);
+
+/* T31: re-run init once for every configured IMU currently latched down
+ * (SPI ERROR / I²C inactive-after-attempt), using the same per-IMU config
+ * this task applied at boot. A transient bus error otherwise leaves an IMU
+ * dead for the rest of boot (the only place its state goes back to OK/true
+ * is inside the init functions, called once at task start). Called by
+ * idl0_session_start() (session.c) right before that session's channel
+ * registry is built. ESP_LOGW's the outcome per IMU retried (session-start
+ * path — allowed); a no-op for IMUs that are already healthy or were never
+ * configured. */
+void idl0_imu_task_reinit_failed(void);

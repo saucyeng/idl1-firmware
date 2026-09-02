@@ -44,6 +44,12 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
  * but operate on I²C-side state. imu_task.c routes calls to the
  * appropriate variant via its bus-dispatch table. */
 bool     idl0_imu_is_active_i2c(uint8_t imu_index);
+/* Was idl0_imu_init_one_i2c() ever called for this index, regardless of
+ * outcome? Mirrors imu_driver.c's internal init-attempted bookkeeping — lets
+ * a caller (idl0_imu_task_state(), idl0_imu_task_reinit_failed() in
+ * imu_task.c) tell "never configured" from "configured but currently down".
+ * Bounds-checks imu_index (false if out of range). */
+bool     idl0_imu_i2c_init_attempted(uint8_t imu_index);
 uint16_t idl0_imu_fifo_count_i2c(uint8_t imu_index);
 bool     idl0_imu_pop_sample_i2c(uint8_t imu_index, idl0_imu_sample_t *out);
 bool     idl0_imu_check_overrun_i2c(uint8_t imu_index);

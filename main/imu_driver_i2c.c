@@ -46,6 +46,11 @@ static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_imu_t      s_i2c[IDL0_IMU_COUNT];
 static stmdev_ctx_t   s_ctx[IDL0_IMU_COUNT];
 static bool           s_active[IDL0_IMU_COUNT];
+/* T31/T32: was idl0_imu_init_one_i2c() ever called for this index? Mirrors
+ * imu_driver.c's s_init_attempted — lets a caller (idl0_imu_task_state(),
+ * idl0_imu_task_reinit_failed() in imu_task.c) tell "never configured" from
+ * "configured but currently down", which s_active alone cannot. */
+static bool           s_init_attempted[IDL0_IMU_COUNT];
 static bool           s_overrun_flag[IDL0_IMU_COUNT];
 static int16_t        s_pending_gyro[IDL0_IMU_COUNT][3];
 static bool           s_have_gyro[IDL0_IMU_COUNT];
@@ -231,6 +236,24 @@ static void diag_dump_one(uint8_t imu_index, uint8_t i2c_addr)
 
 /* --- Public API --- */
 
+/* T29: checks an ST-driver config-write's int32_t return. On failure, logs
+ * which call failed, marks this IMU inactive (a config write failing mid-
+ * sequence otherwise leaves the chip at whatever power-on-reset ODR/FIFO
+ * mode it stopped at, while the driver still reports it active), and
+ * returns false out of the calling function. Local to
+ * idl0_imu_init_one_i2c() (needs `imu_idx` == the function's `imu_index`
+ * in scope) — a macro avoids repeating this 4-line check for all 11
+ * register-config calls. Mirrors imu_driver.c's IMU_CFG_CHECK. */
+#define IMU_CFG_CHECK_I2C(imu_idx, name, call) do {                        \
+        int32_t _rc = (call);                                              \
+        if (_rc != 0) {                                                    \
+            ESP_LOGE(TAG, "IMU%u(I2C) init: %s failed: rc=%ld",            \
+                     (unsigned)(imu_idx), name, (long)_rc);                \
+            s_active[imu_idx] = false;                                     \
+            return false;                                                  \
+        }                                                                  \
+    } while (0)
+
 bool idl0_imu_init_one_i2c(uint8_t imu_index,
                            uint8_t i2c_addr,
                            uint16_t sample_rate_hz,
@@ -242,6 +265,7 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
         ESP_LOGE(TAG, "init_one_i2c: index %u out of range", (unsigned)imu_index);
         return false;
     }
+    s_init_attempted[imu_index] = true;
     if (!i2c_bus_init()) return false;
 
     s_active[imu_index] = false;
@@ -277,35 +301,54 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
     }
 
     /* Software reset, wait for it to clear. */
-    lsm6dso32x_reset_set(ctx, PROPERTY_ENABLE);
+    IMU_CFG_CHECK_I2C(imu_index, "reset_set", lsm6dso32x_reset_set(ctx, PROPERTY_ENABLE));
     uint8_t rst = 1;
     for (int i = 0; i < 10 && rst != 0; i++) {
         lsm6dso32x_reset_get(ctx, &rst);
         platform_mdelay(2);
     }
 
-    lsm6dso32x_block_data_update_set(ctx, PROPERTY_ENABLE);
+    IMU_CFG_CHECK_I2C(imu_index, "block_data_update_set",
+                      lsm6dso32x_block_data_update_set(ctx, PROPERTY_ENABLE));
 
-    lsm6dso32x_xl_full_scale_set(ctx, xl_fs_enum(accel_range_g));
-    lsm6dso32x_gy_full_scale_set(ctx, gy_fs_enum(gyro_range_dps));
-    lsm6dso32x_xl_data_rate_set(ctx, xl_odr_enum(sample_rate_hz));
-    lsm6dso32x_gy_data_rate_set(ctx, gy_odr_enum(sample_rate_hz));
+    IMU_CFG_CHECK_I2C(imu_index, "xl_full_scale_set",
+                      lsm6dso32x_xl_full_scale_set(ctx, xl_fs_enum(accel_range_g)));
+    IMU_CFG_CHECK_I2C(imu_index, "gy_full_scale_set",
+                      lsm6dso32x_gy_full_scale_set(ctx, gy_fs_enum(gyro_range_dps)));
+    IMU_CFG_CHECK_I2C(imu_index, "xl_data_rate_set",
+                      lsm6dso32x_xl_data_rate_set(ctx, xl_odr_enum(sample_rate_hz)));
+    IMU_CFG_CHECK_I2C(imu_index, "gy_data_rate_set",
+                      lsm6dso32x_gy_data_rate_set(ctx, gy_odr_enum(sample_rate_hz)));
 
     if (high_performance) {
-        lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_HIGH_PERFORMANCE_MD);
-        lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_HIGH_PERFORMANCE);
+        IMU_CFG_CHECK_I2C(imu_index, "xl_power_mode_set(HP)",
+                          lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_HIGH_PERFORMANCE_MD));
+        IMU_CFG_CHECK_I2C(imu_index, "gy_power_mode_set(HP)",
+                          lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_HIGH_PERFORMANCE));
     } else {
-        lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_LOW_NORMAL_POWER_MD);
-        lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_NORMAL);
+        IMU_CFG_CHECK_I2C(imu_index, "xl_power_mode_set(LN)",
+                          lsm6dso32x_xl_power_mode_set(ctx, LSM6DSO32X_LOW_NORMAL_POWER_MD));
+        IMU_CFG_CHECK_I2C(imu_index, "gy_power_mode_set(LN)",
+                          lsm6dso32x_gy_power_mode_set(ctx, LSM6DSO32X_GY_NORMAL));
     }
 
-    lsm6dso32x_fifo_xl_batch_set(ctx, xl_bdr_enum(sample_rate_hz));
-    lsm6dso32x_fifo_gy_batch_set(ctx, gy_bdr_enum(sample_rate_hz));
-    lsm6dso32x_fifo_mode_set(ctx, LSM6DSO32X_STREAM_MODE);
+    IMU_CFG_CHECK_I2C(imu_index, "fifo_xl_batch_set",
+                      lsm6dso32x_fifo_xl_batch_set(ctx, xl_bdr_enum(sample_rate_hz)));
+    IMU_CFG_CHECK_I2C(imu_index, "fifo_gy_batch_set",
+                      lsm6dso32x_fifo_gy_batch_set(ctx, gy_bdr_enum(sample_rate_hz)));
+    IMU_CFG_CHECK_I2C(imu_index, "fifo_mode_set",
+                      lsm6dso32x_fifo_mode_set(ctx, LSM6DSO32X_STREAM_MODE));
 
     s_have_gyro[imu_index]    = false;
     s_gyro_fresh[imu_index]   = false;
     s_overrun_flag[imu_index] = false;
+    /* T31: clear the pair-builder diagnostic counters too (mirrors the same
+     * gap fixed in imu_driver.c), so a re-init (idl0_imu_task_reinit_failed(),
+     * session.c at session start) starts clean instead of carrying stale
+     * reuse/unknown counts from before the fault into the new session's diag
+     * summary. */
+    s_reuse[imu_index]        = 0;
+    s_unknown[imu_index]      = 0;
     s_active[imu_index]       = true;
     ESP_LOGI(TAG, "IMU%u up on I²C @ 0x%02X: ODR=%u Hz, AccelFS=±%ug, GyroFS=±%udps, %s",
              (unsigned)imu_index, i2c_addr,
@@ -319,6 +362,14 @@ bool idl0_imu_is_active_i2c(uint8_t imu_index)
 {
     if (imu_index >= IDL0_IMU_COUNT) return false;
     return s_active[imu_index];
+}
+
+/* T32/T31: was idl0_imu_init_one_i2c() ever called for this index? See
+ * s_init_attempted's doc above. Out-of-range returns false. */
+bool idl0_imu_i2c_init_attempted(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return false;
+    return s_init_attempted[imu_index];
 }
 
 uint16_t idl0_imu_fifo_count_i2c(uint8_t imu_index)
@@ -425,6 +476,17 @@ size_t idl0_imu_drain_i2c(uint8_t imu_index, idl0_imu_sample_t *out,
      * don't fall behind the 512-word chip FIFO depth. */
     size_t words = level;
     if (words > IMU_BURST_MAX_WORDS) words = IMU_BURST_MAX_WORDS;
+    /* T30: also cap to max_pairs, BEFORE the burst read — mirrors the same
+     * fix in imu_driver.c's idl0_imu_drain(). The parse loop below emits at
+     * most one pair per word (worst case: every word is a lone accel reusing
+     * the pending gyro on a phase slip), so words beyond max_pairs could
+     * never yield more than max_pairs pairs anyway — but the burst read
+     * physically dequeues every word it asks for from the chip FIFO.
+     * Without this cap, a burst larger than max_pairs would dequeue words
+     * the parse loop's `n_pairs < max_pairs` check then silently discards.
+     * Capping here instead leaves that tail in the chip FIFO for the next
+     * poll. */
+    if (words > max_pairs) words = max_pairs;
 
     /* Step 2: one I²C transaction reading words × 7 bytes starting at
      * FIFO_DATA_OUT_TAG (0x78). With IF_INC=1 (default) the chip
