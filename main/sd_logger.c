@@ -47,14 +47,24 @@ static char s_io_buf[IDL0_SD_IO_BUF_BYTES];
  * status publisher reads these cached values instead. Refreshed at mount,
  * session open/close, and on each successful idl0_sd_flush() (piggybacked
  * on the fsync there, which already touches the FAT). Outside an active
- * session the values may be up to one session stale; acceptable per A7. */
-static uint32_t s_free_mb  = 0;
-static uint32_t s_total_mb = 0;
+ * session the values may be up to one session stale; acceptable per A7.
+ * volatile: written on the writer task (idl0_sd_open_session/_flush/
+ * _close_session all run there), read on the esp_timer task via
+ * idl0_sd_free_mb()/idl0_sd_total_mb() from status.c's 1 Hz publish
+ * callback. Single-core C6, u32-aligned — plain loads/stores can't tear,
+ * so no atomics needed, same reasoning as writer_task.c's s_sd_fault. */
+static volatile uint32_t s_free_mb  = 0;
+static volatile uint32_t s_total_mb = 0;
 
 /* Single esp_vfs_fat_info() query refreshes both cached values — it already
  * derives total bytes from the same f_getfree() call free space comes from
  * (fs->n_fatent - 2) * fs->csize * sector_size internally, so there is no
- * separate "total" query to worry about calling too often. */
+ * separate "total" query to worry about calling too often. Silent on
+ * failure (keeps the stale cache, no ESP_LOGW): this now runs from
+ * idl0_sd_flush() on the writer task at ~1 Hz during an active session,
+ * i.e. on the logging path, where an unconditional log call on every
+ * transient esp_vfs_fat_info failure is exactly the kind of per-tick
+ * logging idl0_sd_append's own failure path (above) deliberately avoids. */
 static void sd_refresh_capacity_mb(void)
 {
     if (s_card == NULL) {
@@ -65,7 +75,6 @@ static void sd_refresh_capacity_mb(void)
     uint64_t total_bytes = 0, free_bytes = 0;
     esp_err_t err = esp_vfs_fat_info(IDL0_SD_MOUNT_POINT, &total_bytes, &free_bytes);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_vfs_fat_info failed: %s", esp_err_to_name(err));
         return;
     }
     s_free_mb  = (uint32_t)(free_bytes  / (1024ULL * 1024ULL));
