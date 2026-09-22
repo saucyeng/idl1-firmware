@@ -1,4 +1,4 @@
-# IDL0 firmware main component.
+# IDL1 firmware main component.
 # Each module is added as a SRCS entry as it lands.
 
 idf_component_register(

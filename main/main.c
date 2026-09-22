@@ -1,4 +1,4 @@
-/* IDL0 firmware entry point.
+/* IDL1 firmware entry point.
  *
  * P4 milestone: BLE control plane up. Boots, brings up the status LED
  * and the NimBLE GATT service, and dispatches received commands to a
@@ -94,7 +94,7 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "IDL0 firmware boot");
+    ESP_LOGI(TAG, "IDL1 firmware boot");
 
     idl0_device_id_init();
 

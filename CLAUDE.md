@@ -1,8 +1,16 @@
-# CLAUDE.md — IDL0 Firmware Standing Orders
+# CLAUDE.md — IDL1 Firmware Standing Orders
 
-This repo builds the ESP32-C6 firmware only. It has no local spec copy —
-read `docs/README.md` first, then follow it to the relevant spec section(s)
-before touching code.
+This repo builds the ESP32-C6 firmware for the **IDL1** board only (forked
+from `idl0-firmware`, which is frozen for IDL0 hardware — decisions.md F1/F2).
+It has no local spec copy — read `docs/README.md` first, then follow it to
+the relevant spec section(s) before touching code.
+
+**Authority:** `docs/program/decisions.md` holds the owner's rulings and wins
+over every other doc here. **The plan** is
+`docs/program/2026-09-22-idl1-bringup-phases.md` (phases 1–3 and review
+corrections R1–R10). The spec pointer is unchanged: idl0-app's
+`docs/IDL0_SPEC.md` (the wire format, BLE contract, "IDL0" file magic and
+schema v3 stay as they are through phase 3 — decisions.md F3).
 
 ---
 

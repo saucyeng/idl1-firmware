@@ -57,7 +57,7 @@ jobs:
           # root-owned and this (runner-user) step cannot write into it —
           # stage into a fresh runner-owned dist/ instead (v0.1.0 first-run
           # lesson). Reading root-owned build output is fine.
-          APP_BIN=build/idl0_firmware.bin   # fixed by project(idl0_firmware) in CMakeLists.txt
+          APP_BIN=build/idl1_firmware.bin   # fixed by project(idl1_firmware) in CMakeLists.txt
           test -f "$APP_BIN" || { echo "::error::app image not found at $APP_BIN"; exit 1; }
           V="${VERSION}"
           mkdir -p dist
