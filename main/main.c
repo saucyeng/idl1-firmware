@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "ble_service.h"
+#include "board_leds.h"
 #include "bringup.h"
 #include "device_id.h"
 #include "diag_log.h"
@@ -203,7 +204,8 @@ void app_main(void)
         ESP_LOGE(TAG, "I2C bus init failed; pods and TLA2528 unavailable");
     }
     if (tla2528_init(i2c_bus, IDL1_I2C_ADDR_TLA)) {
-        /* Green = power (H1). Red (recording) stays off in phase 1. */
+        /* Green = power (H1) from here; board_leds takes over the roles once
+         * BLE is up (below). */
         tla2528_led_set(false, true);
     }
 
@@ -222,6 +224,9 @@ void app_main(void)
         idl0_status_publish();
         idl0_status_publisher_start();
     }
+
+    /* Board LED roles (H1): green = power + wireless, red = recording. */
+    idl1_board_leds_start();
 
     /* HRM task picks up the saved address from idl0_config.json. NimBLE
      * is already initialised by idl0_ble_init above; the central role

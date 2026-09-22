@@ -28,6 +28,7 @@ idf_component_register(
          "mode_state.c"
          "diag_log.c"
          "bringup.c"
+         "board_leds.c"
     INCLUDE_DIRS "."
     REQUIRES
         # SD card writer

@@ -63,3 +63,7 @@ void idl0_ble_resume(void);
 
 /* True while the §10.4 radio handoff has BLE suspended. */
 bool idl0_ble_is_suspended(void);
+
+/* True while a central (the phone) is connected to the GATT server. The HRM
+ * strap link (central role, hrm_task.c) does not count. */
+bool idl0_ble_is_connected(void);
