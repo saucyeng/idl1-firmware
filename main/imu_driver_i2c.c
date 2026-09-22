@@ -17,17 +17,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "i2c_bus.h"
 #include "lsm6dso32x_reg.h"
-#include "pins.h"
 
 static const char *TAG = "imu_i2c";
 
-#define I2C_BUS_PORT       I2C_NUM_0
-/* Fast-mode-plus (1 MHz). LSM6DSO32 supports it per datasheet; the
- * prior Saucy prototype (Datalogger v2) ran 3 BMI160s on a similar
- * harness at this clock with no drops. Lower to 400 kHz if signal
- * integrity over the harness ever degrades. */
-#define I2C_BUS_HZ         1000000
 #define I2C_TIMEOUT_MS     100
 #define IMU_WHO_AM_I       0x6C
 /* Max FIFO words drained in one burst. 512 words = the full LSM6DSO32X FIFO
@@ -42,7 +36,6 @@ typedef struct {
     i2c_master_dev_handle_t dev;
 } i2c_imu_t;
 
-static i2c_master_bus_handle_t s_bus = NULL;
 static i2c_imu_t      s_i2c[IDL0_IMU_COUNT];
 static stmdev_ctx_t   s_ctx[IDL0_IMU_COUNT];
 static bool           s_active[IDL0_IMU_COUNT];
@@ -177,30 +170,6 @@ static lsm6dso32x_fs_g_t gy_fs_enum(uint16_t dps)
     }
 }
 
-/* --- I²C bus init (idempotent, runs once on first IMU init) --- */
-
-static bool i2c_bus_init(void)
-{
-    if (s_bus != NULL) return true;
-    i2c_master_bus_config_t bus_config = {
-        .i2c_port          = I2C_BUS_PORT,
-        .sda_io_num        = IDL1_PIN_I2C_SDA,
-        .scl_io_num        = IDL1_PIN_I2C_SCL,
-        .clk_source        = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    esp_err_t err = i2c_new_master_bus(&bus_config, &s_bus);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "i2c_new_master_bus: %s", esp_err_to_name(err));
-        s_bus = NULL;
-        return false;
-    }
-    ESP_LOGI(TAG, "I²C bus up: SDA=GPIO%d SCL=GPIO%d @ %u Hz",
-             IDL1_PIN_I2C_SDA, IDL1_PIN_I2C_SCL, (unsigned)I2C_BUS_HZ);
-    return true;
-}
-
 /* DIAG: same dump as imu_driver.c's diag_dump_one, but over I²C. Lets
  * us compare the IMU0 (SPI) and IMU1 (I²C) burst reads side-by-side
  * in the boot log to confirm the chip is now reachable. Remove with
@@ -266,7 +235,8 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
         return false;
     }
     s_init_attempted[imu_index] = true;
-    if (!i2c_bus_init()) return false;
+    i2c_master_bus_handle_t bus = idl1_i2c_bus_get();
+    if (bus == NULL) return false;
 
     s_active[imu_index] = false;
 
@@ -287,9 +257,9 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = i2c_addr,
-        .scl_speed_hz    = I2C_BUS_HZ,
+        .scl_speed_hz    = IDL1_I2C_SCL_HZ,
     };
-    esp_err_t err = i2c_master_bus_add_device(s_bus, &dev_cfg,
+    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg,
                                               &s_i2c[imu_index].dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IMU%u(I²C@0x%02X) bus_add_device: %s",
@@ -473,7 +443,7 @@ size_t idl0_imu_drain_i2c(uint8_t imu_index, idl0_imu_sample_t *out,
     stmdev_ctx_t *ctx = &s_ctx[imu_index];
 
     /* Step 1: how many FIFO words are unread, and is the overrun bit
-     * latched? Two register reads, ~30 µs each at 1 MHz. */
+     * latched? Two register reads, ~75 µs each at 400 kHz. */
     uint16_t level = 0;
     if (lsm6dso32x_fifo_data_level_get(ctx, &level) != 0) {
         s_active[imu_index] = false;

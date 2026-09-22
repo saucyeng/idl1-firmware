@@ -16,6 +16,7 @@ idf_component_register(
          "gps_task.c"
          "imu_driver.c"
          "imu_driver_i2c.c"
+         "i2c_bus.c"
          "imu_task.c"
          "wifi_server.c"
          "ota.c"
@@ -29,7 +30,7 @@ idf_component_register(
         fatfs sdmmc esp_driver_sdspi
         # GPIO (LED, buttons) + UART (GPS)
         esp_driver_gpio esp_driver_uart
-        # TEMP: I²C master driver for external IMUs (imu_driver_i2c.c)
+        # I2C master driver: shared IDL1 bus (i2c_bus.c) — pod IMUs, TLA2528
         esp_driver_i2c
         # esp_timer_get_time (session), esp_random / esp_mac (device_id)
         esp_timer esp_hw_support

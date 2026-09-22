@@ -26,7 +26,8 @@
 #include "imu_driver.h"   /* for idl0_imu_sample_t and IDL0_IMU_COUNT */
 
 /* Initialise one IMU on the shared I²C bus at the given 7-bit address.
- * Allocates the bus on first call. Verifies WHO_AM_I (0x6C). Configures
+ * Uses the shared bus from idl1_i2c_bus_get() (i2c_bus.h) at
+ * IDL1_I2C_SCL_HZ. Verifies WHO_AM_I (0x6C). Configures
  * accel + gyro at the requested ODR / range / mode, then enables FIFO
  * continuous + BDR equal to ODR. Mirrors idl0_imu_init_one() but over
  * I²C instead of SPI.
