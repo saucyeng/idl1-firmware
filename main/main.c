@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "ble_service.h"
+#include "button.h"
 #include "board_leds.h"
 #include "bringup.h"
 #include "device_id.h"
@@ -116,8 +117,10 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
  * TLA2528 (and both board LEDs), both pods, Qwiic. Its ON input is a
  * non-latching level with no pull on the net, so GPIO2 must be an actively
  * driven output from here on. Nothing else in the firmware may reconfigure
- * IDL1_PIN_PWR_EN — no gpio_reset_pin(), no direction change, no sleep
- * path — or the whole board goes dark while the MCU keeps running.
+ * IDL1_PIN_PWR_EN — no gpio_reset_pin(), no direction change — or the whole board goes dark while the MCU keeps running.
+ *
+ * One sanctioned exception: the long-press power-off in button.c drives
+ * it low and holds it through deep sleep.
  *
  * The level is set before the pin is switched to output so the pad never
  * drives low on the way up. INPUT_OUTPUT rather than OUTPUT keeps the input
@@ -145,6 +148,7 @@ void app_main(void)
      * unpowered IMU/SD back-powers it through its input clamp diodes
      * (bring-up correction R7), so the order is PWR_EN -> settle -> CS idle
      * -> buses. */
+    idl1_button_release_sleep_holds();   /* button power-off holds PWR_EN low */
     idl1_power_rail_on();
     vTaskDelay(pdMS_TO_TICKS(IDL1_PWR_EN_SETTLE_MS));
 
@@ -246,6 +250,9 @@ void app_main(void)
      * after everything above so it reports their boot results; takes
      * IDL1_BRINGUP_WINDOW_MS to watch GPS traffic. */
     idl1_bringup_report();
+
+    /* After the self-test, which samples USER_BTN itself. */
+    idl1_button_start();
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));

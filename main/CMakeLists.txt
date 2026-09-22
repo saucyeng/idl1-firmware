@@ -28,6 +28,7 @@ idf_component_register(
          "mode_state.c"
          "diag_log.c"
          "bringup.c"
+         "button.c"
          "board_leds.c"
     INCLUDE_DIRS "."
     REQUIRES
