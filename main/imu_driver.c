@@ -53,12 +53,14 @@ static const char *TAG = "imu";
  */
 #define IMU_SPI_BURST_MAX_WORDS 512
 
-/* CS pin per IMU index. Order matches pins.h §3 (IMU0 onboard sprung
- * mass; IMU1 front unsprung; IMU2 rear unsprung). */
-static const int s_cs_pin[IDL0_IMU_COUNT] = {
-    IDL0_PIN_CS_IMU0,
-    IDL0_PIN_CS_IMU1,
-    IDL0_PIN_CS_IMU2,
+/* CS pin per IMU index (IMU0 onboard sprung mass; IMU1 front pod; IMU2 rear
+ * pod). On IDL1 only IMU0 is on SPI: the pod IMUs are I2C devices
+ * (imu_driver_i2c.c, addresses in pins.h) and have no chip-select, so their
+ * slots are GPIO_NUM_NC and idl0_imu_init_one() refuses them. */
+static const gpio_num_t s_cs_pin[IDL0_IMU_COUNT] = {
+    IDL1_PIN_CS_IMU0,
+    GPIO_NUM_NC,
+    GPIO_NUM_NC,
 };
 
 /* Per-IMU runtime state. NULL spi handle == slot not yet attempted. */
@@ -337,6 +339,14 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
 {
     if (imu_index >= IDL0_IMU_COUNT) {
         ESP_LOGE(TAG, "init_one: index %u out of range", (unsigned)imu_index);
+        return false;
+    }
+
+    if (s_cs_pin[imu_index] == GPIO_NUM_NC) {
+        /* IDL1: IMU1/IMU2 are I2C pods. Reaching here is a bus-map bug in the
+         * caller (imu_task.c s_imu_bus[]), not a missing chip. */
+        ESP_LOGE(TAG, "init_one: IMU%u has no SPI chip-select on IDL1 (I2C pod)",
+                 (unsigned)imu_index);
         return false;
     }
 

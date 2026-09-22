@@ -119,15 +119,14 @@ void app_main(void)
     }
     idl0_led_set(IDL0_LED_BLINK_SLOW);
 
-    /* Idle every SPI peripheral's CS line BEFORE bringing up the shared
-     * SPI bus. Without this, IMU1 / IMU2 CS pins (GPIO 21 / 22) sit
-     * high-Z at reset and the LSM6DSO32 chips read their floating CS as
-     * asserted, then drive MISO during SD card init — corrupting the
-     * SCR read and failing the mount with ESP_ERR_INVALID_RESPONSE.
-     * IMU0's CS is later re-claimed by the spi_master driver via
-     * spics_io_num; explicit pre-idling is harmless. */
+    /* Idle every SPI chip-select BEFORE bringing up the shared SPI bus, so
+     * no device reads a floating CS as asserted and drives MISO during SD
+     * card init (on IDL0 that corrupted the SCR read and failed the mount
+     * with ESP_ERR_INVALID_RESPONSE). On IDL1 only the onboard IMU0 and the
+     * SD card sit on SPI; IMU0's CS is later re-claimed by the spi_master
+     * driver via spics_io_num, so explicit pre-idling is harmless. */
     static const gpio_num_t cs_pins[] = {
-        IDL0_PIN_CS_IMU0, IDL0_PIN_CS_IMU1, IDL0_PIN_CS_IMU2,
+        IDL1_PIN_CS_IMU0, IDL1_PIN_CS_SD,
     };
     for (size_t i = 0; i < sizeof(cs_pins) / sizeof(cs_pins[0]); i++) {
         gpio_reset_pin(cs_pins[i]);

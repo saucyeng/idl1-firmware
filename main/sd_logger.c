@@ -106,12 +106,13 @@ uint32_t idl0_sd_total_mb(void)
 
 bool idl0_sd_init(spi_host_device_t spi_host)
 {
-    /* Shared SPI bus — also used by the IMUs (P7). Initialised here
-     * because the SD card is the first device on it. */
+    /* Shared SPI bus — also used by the onboard IMU0 (the pod IMUs are on
+     * I2C on IDL1). Initialised here because the SD card is the first
+     * device on it. */
     spi_bus_config_t bus_cfg = {
-        .mosi_io_num     = IDL0_PIN_SPI_MOSI,
-        .miso_io_num     = IDL0_PIN_SPI_MISO,
-        .sclk_io_num     = IDL0_PIN_SPI_SCK,
+        .mosi_io_num     = IDL1_PIN_SPI_MOSI,
+        .miso_io_num     = IDL1_PIN_SPI_MISO,
+        .sclk_io_num     = IDL1_PIN_SPI_SCK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
         .max_transfer_sz = 4096,
@@ -132,7 +133,7 @@ bool idl0_sd_init(spi_host_device_t spi_host)
     };
 
     sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_cfg.gpio_cs  = IDL0_PIN_CS_SD;
+    slot_cfg.gpio_cs  = IDL1_PIN_CS_SD;   /* GPIO7 on IDL1 (was 23 = SCL now) */
     slot_cfg.host_id  = spi_host;
 
     sdmmc_host_t host  = SDSPI_HOST_DEFAULT();

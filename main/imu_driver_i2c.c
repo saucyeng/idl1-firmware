@@ -184,8 +184,8 @@ static bool i2c_bus_init(void)
     if (s_bus != NULL) return true;
     i2c_master_bus_config_t bus_config = {
         .i2c_port          = I2C_BUS_PORT,
-        .sda_io_num        = IDL0_PIN_I2C_SDA,
-        .scl_io_num        = IDL0_PIN_I2C_SCL,
+        .sda_io_num        = IDL1_PIN_I2C_SDA,
+        .scl_io_num        = IDL1_PIN_I2C_SCL,
         .clk_source        = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
@@ -197,7 +197,7 @@ static bool i2c_bus_init(void)
         return false;
     }
     ESP_LOGI(TAG, "I²C bus up: SDA=GPIO%d SCL=GPIO%d @ %u Hz",
-             IDL0_PIN_I2C_SDA, IDL0_PIN_I2C_SCL, (unsigned)I2C_BUS_HZ);
+             IDL1_PIN_I2C_SDA, IDL1_PIN_I2C_SCL, (unsigned)I2C_BUS_HZ);
     return true;
 }
 
