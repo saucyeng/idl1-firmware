@@ -24,6 +24,7 @@ idf_component_register(
          "digital_task.c"
          "mode_state.c"
          "diag_log.c"
+         "bringup.c"
     INCLUDE_DIRS "."
     REQUIRES
         # SD card writer
@@ -46,4 +47,6 @@ idf_component_register(
         app_update
         # TLA2528 ADC / GPO expander: IDL1 board LEDs + pod analog
         tla2528
+        # Oneshot ADC + calibration: battery sense in the boot self-test (bringup.c)
+        esp_adc
 )

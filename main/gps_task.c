@@ -35,6 +35,13 @@ static bool         s_have_fix     = false;
  * on. Plain uint32_t — single-core chip, increment-only diagnostics. */
 static uint32_t s_diag_writer_drops;
 
+/* Boot self-test counters (bringup.c): raw UART bytes read and '$' lines
+ * dispatched, since boot. One add per read / per line — no logging, no
+ * extra parsing on the logging path. Same single-core, increment-only
+ * reasoning as s_diag_writer_drops. */
+static uint32_t s_diag_rx_bytes;
+static uint32_t s_diag_rx_sentences;
+
 static void emit_fix(const idl0_gps_fix_t *fix)
 {
     uint8_t buf[40];
@@ -64,6 +71,7 @@ static void dispatch_line(char *line, size_t line_len)
 {
     line[line_len] = '\0';
     if (line_len == 0 || line[0] != '$') return;
+    s_diag_rx_sentences++;
     idl0_gps_fix_t fix = {0};
     if (idl0_gps_feed_line(line, &fix)) {
         if (idl0_session_is_running()) {
@@ -109,6 +117,7 @@ static void gps_task_fn(void *arg)
 
         int n = uart_read_bytes(IDL0_GPS_UART, chunk, sizeof(chunk),
                                 pdMS_TO_TICKS(100));
+        if (n > 0) s_diag_rx_bytes += (uint32_t)n;
         for (int i = 0; i < n; i++) {
             uint8_t c = chunk[i];
             if (c == '\r') {
@@ -185,4 +194,14 @@ uint32_t gps_task_diag_writer_drops(void)
 void gps_task_diag_reset(void)
 {
     s_diag_writer_drops = 0;
+}
+
+uint32_t gps_task_diag_rx_bytes(void)
+{
+    return s_diag_rx_bytes;
+}
+
+uint32_t gps_task_diag_rx_sentences(void)
+{
+    return s_diag_rx_sentences;
 }

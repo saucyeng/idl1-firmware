@@ -23,3 +23,9 @@ uint32_t gps_task_diag_writer_drops(void);
 /* Zero the writer-drop counter. Called by the session layer at
  * idl0_session_start(). */
 void gps_task_diag_reset(void);
+
+/* Boot self-test counters (bringup.c), monotonic since boot, never reset.
+ * Units: bytes read from the GPS UART / NMEA lines starting with '$'
+ * (checksum not verified — this counts traffic, not valid fixes). */
+uint32_t gps_task_diag_rx_bytes(void);
+uint32_t gps_task_diag_rx_sentences(void);

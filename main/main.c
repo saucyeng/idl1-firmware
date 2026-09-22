@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "ble_service.h"
+#include "bringup.h"
 #include "device_id.h"
 #include "diag_log.h"
 #include "driver/gpio.h"
@@ -118,13 +119,15 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
  * path — or the whole board goes dark while the MCU keeps running.
  *
  * The level is set before the pin is switched to output so the pad never
- * drives low on the way up. */
+ * drives low on the way up. INPUT_OUTPUT rather than OUTPUT keeps the input
+ * buffer on so the boot self-test can read the pad back; it does not
+ * change what the pin drives. */
 static void idl1_power_rail_on(void)
 {
     gpio_set_level(IDL1_PIN_PWR_EN, 1);
     const gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << IDL1_PIN_PWR_EN,
-        .mode         = GPIO_MODE_OUTPUT,
+        .mode         = GPIO_MODE_INPUT_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE,
@@ -233,6 +236,11 @@ void app_main(void)
      * long-session WiFi degradation. No-op without SD; skips itself during a
      * logging session so it never contends with session writes. */
     idl0_diag_log_init();
+
+    /* Last: the one-block boot self-test report (bring-up phase 1). Runs
+     * after everything above so it reports their boot results; takes
+     * IDL1_BRINGUP_WINDOW_MS to watch GPS traffic. */
+    idl1_bringup_report();
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));
