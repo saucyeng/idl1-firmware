@@ -21,17 +21,19 @@
 #include "idl0_format.h"
 #include "imu_driver.h"
 #include "imu_driver_i2c.h"
+#include "imu_ranges.h"
 #include "mode_state.h"
 #include "pins.h"
 #include "session.h"
 #include "writer_task.h"
 
-#define IMU_POLL_MS            20    /* drain every 20 ms — keeps FIFO occupancy
-                                      * ~17 pairs at 833 Hz (was 50 ms → ~127
-                                      * pairs ≈ FIFO capacity = drops). */
-#define IMU_DRAIN_MAX_PAIRS    256   /* full LSM6DSO32X FIFO (256 pairs). Lets one
-                                      * drain fully recover after a stall instead
-                                      * of leaving residual to overflow. */
+#define IMU_POLL_MS            20    /* drain every 20 ms — ~10 pairs per drain
+                                      * at the 480 Hz default, ~39 at 1920 Hz;
+                                      * the 511-word FIFO holds ~255 pairs. */
+#define IMU_DRAIN_MAX_PAIRS    256   /* a full LSM6DSV320X FIFO (511 words = 255
+                                      * pairs + 1). Lets one drain fully recover
+                                      * after a stall instead of leaving residual
+                                      * to overflow. */
 #define IMU_DIAG_LOG_PERIOD_MS 5000  /* periodic serial "drained N pairs" log */
 
 static const char *TAG = "imu_task";
@@ -60,16 +62,6 @@ static inline idl0_imu_probe_t imu_probe(uint8_t i) {
         : idl0_imu_probe_result(i);
 }
 
-/* Bring-up phase 1: an LSM6DSV320X answered WHO_AM_I but the DSO32 driver
- * declined to configure it. That is a known, healthy "present, not driven
- * yet" state — not an IMU fault — so the status aggregate and the
- * session-start re-init both skip it. */
-static inline bool imu_detected_not_driven(uint8_t i) {
-    const idl0_imu_probe_t p = imu_probe(i);
-    return p.status == IDL0_IMU_PROBE_ANSWERED &&
-           p.who_am_i == IDL1_IMU_WHO_AM_I_DSV320X;
-}
-
 static inline bool imu_is_active(uint8_t i) {
     return s_imu_bus[i] == IDL0_BUS_I2C
         ? idl0_imu_is_active_i2c(i)
@@ -91,7 +83,7 @@ static inline void imu_take_pair_diag(uint8_t i, uint32_t *reuse, uint32_t *unkn
 }
 
 static TaskHandle_t s_task         = NULL;
-static uint16_t     s_odr_hz       = 104;
+static uint16_t     s_odr_hz       = IDL1_IMU_DEFAULT_ODR_HZ;
 static uint32_t     s_channel_mask = 0;
 
 /* Boot-time per-IMU config, persisted so idl0_imu_task_reinit_failed() (T31)
@@ -116,6 +108,13 @@ static int64_t  s_diag_last_log_us;
  * step ≤2 ms backwards at a drain boundary on the first-drained IMU). */
 static int64_t s_last_ts[IDL0_IMU_COUNT] = { INT64_MIN, INT64_MIN, INT64_MIN };
 
+/* T41 / decisions.md A5: which IMUs were active when the current session
+ * started. Snapshotted by imu_task_fn on the session's not-running ->
+ * running edge (this task is the only reader/writer). An IMU that was
+ * active then and has since dropped out emits one zero-filled IMU_SAMPLE per
+ * poll cycle, so the gap is explicit in the file rather than silent. */
+static bool s_active_at_session_start[IDL0_IMU_COUNT];
+
 /* Session drain instrumentation. Accumulated in RAM across a logging session
  * and emitted to the on-SD diag log (idl0_debug.log) by idl0_imu_diag_flush()
  * AFTER the session file closes — never written mid-session (§1: raw capture
@@ -139,14 +138,35 @@ static uint32_t s_m_writer_drops;
 static idl0_imu_sample_t s_pairs[IMU_DRAIN_MAX_PAIRS];
 static uint8_t           s_batch[IMU_DRAIN_MAX_PAIRS * 24];
 
+/* T41 / A5: one zero-filled IMU_SAMPLE for an IMU that was active at
+ * session start and is now down, timestamped at this poll. */
+static void emit_zero_record(uint8_t imu_index)
+{
+    int64_t ts = esp_timer_get_time();
+    if (ts <= s_last_ts[imu_index]) ts = s_last_ts[imu_index] + 1;
+    s_last_ts[imu_index] = ts;
+    static const int16_t zero_axes[6] = {0};
+    uint8_t rec[24];   /* max IMU_SAMPLE record size, bytes */
+    const size_t n = idl0_format_imu_sample(rec, imu_index, ts, s_channel_mask, zero_axes);
+    if (n > 0 && !idl0_writer_submit(rec, n)) {
+        s_m_writer_drops++;
+        s_diag_writer_drops++;
+    }
+}
+
 static void drain_one(uint8_t imu_index, int64_t period_us)
 {
-    if (!imu_is_active(imu_index)) return;
     /* T20: require mask has at least one channel bit set. No registry entries
      * exist for a maskless IMU — such records would be unexplainable overhead
      * (~12 bytes every ~20 ms for the session). */
     uint32_t imu_bits = (s_channel_mask >> (imu_index * 6)) & 0x3Fu;
     if (imu_bits == 0) return;
+    if (!imu_is_active(imu_index)) {
+        if (s_active_at_session_start[imu_index] && idl0_session_is_running()) {
+            emit_zero_record(imu_index);
+        }
+        return;
+    }
 
     /* Snapshot the read instant before draining so all per-sample
      * timestamps anchor on the same t_read for this IMU. */
@@ -244,8 +264,9 @@ void idl0_imu_diag_flush(void)
         uint32_t reuse = 0, unknown = 0;
         imu_take_pair_diag(i, &reuse, &unknown);
         idl0_diag_log_event(
-            "IMU%u %s drains=%lu pairs=%lu ovr=%lu reuse=%lu unk=%lu read_us=%lu/%lu tot_us=%lu/%lu",
+            "IMU%u %s odr_hz=%u drains=%lu pairs=%lu ovr=%lu reuse=%lu unk=%lu read_us=%lu/%lu tot_us=%lu/%lu",
             (unsigned)i, s_imu_bus[i] == IDL0_BUS_I2C ? "i2c" : "spi",
+            (unsigned)s_odr_hz,
             (unsigned long)s_m_drains[i], (unsigned long)s_m_pairs[i],
             (unsigned long)s_m_overruns[i],
             (unsigned long)reuse, (unsigned long)unknown,
@@ -286,7 +307,6 @@ idl0_imu_state_t idl0_imu_task_state(void)
     int attempted = 0, ok_count = 0, error = 0;
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!s_imu_enabled[i]) continue;
-        if (imu_detected_not_driven(i)) continue;   /* phase 1: see helper */
         attempted++;
         if (s_imu_bus[i] == IDL0_BUS_I2C) {
             if (idl0_imu_is_active_i2c(i)) {
@@ -313,7 +333,6 @@ void idl0_imu_task_reinit_failed(void)
 {
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!s_imu_enabled[i]) continue;
-        if (imu_detected_not_driven(i)) continue;   /* nothing to recover */
 
         if (s_imu_bus[i] == IDL0_BUS_I2C) {
             if (idl0_imu_is_active_i2c(i)) continue;        /* already healthy */
@@ -335,6 +354,12 @@ void idl0_imu_task_reinit_failed(void)
                      (unsigned)i, ok ? "recovered" : "still down");
         }
     }
+}
+
+bool idl0_imu_task_is_active(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return false;
+    return imu_is_active(imu_index);
 }
 
 idl0_imu_probe_t idl0_imu_task_probe(uint8_t imu_index)
@@ -377,6 +402,7 @@ static void imu_task_fn(void *arg)
     s_diag_last_log_us = esp_timer_get_time();
     bool prev_wifi = (idl0_mode_get_bits() & IDL0_MODE_BIT_WIFI_UP) != 0;
     int64_t prev_cycle_us = 0;   /* start of the previous drain pass */
+    bool prev_running = false;   /* session state at the previous cycle */
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(IMU_POLL_MS));
@@ -399,6 +425,15 @@ static void imu_task_fn(void *arg)
             if (!wifi_up) s_diag_last_log_us = esp_timer_get_time();
         }
         if (wifi_up) continue;
+
+        /* T41: snapshot which IMUs are live as a session starts. */
+        const bool running = idl0_session_is_running();
+        if (running && !prev_running) {
+            for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+                s_active_at_session_start[i] = imu_is_active(i);
+            }
+        }
+        prev_running = running;
 
         const int64_t cycle_start_us = esp_timer_get_time();
         for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {

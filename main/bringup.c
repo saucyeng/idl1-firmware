@@ -90,9 +90,14 @@ static row_t imu_row(uint8_t idx, bool on_i2c, char *detail, size_t dlen,
     }
     snprintf(tok, tlen, "%02x", p.who_am_i);
     if (p.who_am_i == IDL1_IMU_WHO_AM_I_DSV320X) {
-        snprintf(detail, dlen, "WHO_AM_I=0x%02X LSM6DSV320X (not driven until phase 2)",
+        if (idl0_imu_task_is_active(idx)) {
+            snprintf(detail, dlen, "WHO_AM_I=0x%02X LSM6DSV320X, configured and running",
+                     p.who_am_i);
+            return ROW_PASS;
+        }
+        snprintf(detail, dlen, "WHO_AM_I=0x%02X LSM6DSV320X but configuration FAILED (see log)",
                  p.who_am_i);
-        return ROW_PASS;
+        return ROW_FAIL;
     }
     if (!on_i2c && (p.who_am_i == 0x00 || p.who_am_i == 0xFF)) {
         snprintf(detail, dlen, "WHO_AM_I=0x%02X: nothing driving MISO (chip unpowered / CS?)",

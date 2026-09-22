@@ -16,6 +16,8 @@ idf_component_register(
          "gps_task.c"
          "imu_driver.c"
          "imu_driver_i2c.c"
+         "imu_chip_dsv320x.c"
+         "imu_ranges.c"
          "i2c_bus.c"
          "imu_task.c"
          "wifi_server.c"
@@ -40,8 +42,8 @@ idf_component_register(
         bt nvs_flash
         # FreeRTOS ring buffer (writer_task.c — freertos/ringbuf.h)
         esp_ringbuf
-        # Vendored ST LSM6DSO32 driver (firmware/components/lsm6dso32x_STdC, pinned to v2.3.0)
-        lsm6dso32x_STdC
+        # Vendored ST LSM6DSV320X driver (components/lsm6dsv320x_STdC, pinned to v5.4.0)
+        lsm6dsv320x_STdC
         # WiFi AP + HTTP server (wifi_server.c)
         esp_wifi esp_netif esp_event esp_http_server
         # OTA write + boot partition control (ota.c)
