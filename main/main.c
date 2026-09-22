@@ -1,9 +1,9 @@
 /* IDL1 firmware entry point.
  *
- * P4 milestone: BLE control plane up. Boots, brings up the status LED
- * and the NimBLE GATT service, and dispatches received commands to a
- * handler that logs them and reflects logging state on the LED. Real
- * command behaviour (SD, sensors) arrives in P5+.
+ * Boot order (bring-up phase 1): switched-rail power (PWR_EN) first, then
+ * the MCU-only subsystems, then the buses and sensors on the switched rail,
+ * then BLE, and finally the one-block boot self-test report (bringup.c).
+ * BLE control commands are dispatched to on_ble_command() below.
  */
 
 #include <stdio.h>
@@ -92,8 +92,49 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
     return ack;
 }
 
+/* Settle time after PWR_EN goes high before anything on the switched rail
+ * is touched, ms. Rounded envelope over: TPS22919 rail rise, LSM6DSV320X
+ * boot, gyro turn-on 40 ms, ATS601 <=1 ms, TLA2528 tPU <=5 ms
+ * (pod-firmware-plan.md PT17). A boot-sequencing constant, not a sensor
+ * setting. */
+#define IDL1_PWR_EN_SETTLE_MS 50
+
+/* Drive PWR_EN high and leave it there for the life of the firmware.
+ *
+ * U2 (TPS22919) switches +3V3 to every peripheral: GNSS, onboard IMU, SD,
+ * TLA2528 (and both board LEDs), both pods, Qwiic. Its ON input is a
+ * non-latching level with no pull on the net, so GPIO2 must be an actively
+ * driven output from here on. Nothing else in the firmware may reconfigure
+ * IDL1_PIN_PWR_EN — no gpio_reset_pin(), no direction change, no sleep
+ * path — or the whole board goes dark while the MCU keeps running.
+ *
+ * The level is set before the pin is switched to output so the pad never
+ * drives low on the way up. */
+static void idl1_power_rail_on(void)
+{
+    gpio_set_level(IDL1_PIN_PWR_EN, 1);
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << IDL1_PIN_PWR_EN,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(IDL1_PIN_PWR_EN, 1);
+}
+
 void app_main(void)
 {
+    /* First statement: power the switched rail. Everything that drives a
+     * line into a switched-rail chip (SPI chip-selects, SPI/I2C buses, the
+     * GPS UART) must wait for the settle below. Driving a CS high into an
+     * unpowered IMU/SD back-powers it through its input clamp diodes
+     * (bring-up correction R7), so the order is PWR_EN -> settle -> CS idle
+     * -> buses. */
+    idl1_power_rail_on();
+    vTaskDelay(pdMS_TO_TICKS(IDL1_PWR_EN_SETTLE_MS));
+
     ESP_LOGI(TAG, "IDL1 firmware boot");
 
     idl0_device_id_init();
