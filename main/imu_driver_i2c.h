@@ -27,10 +27,12 @@
 
 /* Initialise one IMU on the shared I²C bus at the given 7-bit address.
  * Uses the shared bus from idl1_i2c_bus_get() (i2c_bus.h) at
- * IDL1_I2C_SCL_HZ. Verifies WHO_AM_I (0x6C). Configures
- * accel + gyro at the requested ODR / range / mode, then enables FIFO
- * continuous + BDR equal to ODR. Mirrors idl0_imu_init_one() but over
- * I²C instead of SPI.
+ * IDL1_I2C_SCL_HZ. Probes the address (an absent pod is logged at INFO),
+ * then reads WHO_AM_I before any register write. Only on 0x6C (LSM6DSO32)
+ * does it configure accel + gyro at the requested ODR / range / mode and
+ * enable FIFO continuous + BDR equal to ODR; on 0x73 (LSM6DSV320X, every
+ * IDL1 pod) it records the chip and leaves it untouched. Mirrors
+ * idl0_imu_init_one() but over I²C instead of SPI.
  *
  * Returns true on success. On failure the per-instance state is left
  * inactive so other IMUs are unaffected. */
@@ -51,6 +53,9 @@ bool     idl0_imu_is_active_i2c(uint8_t imu_index);
  * imu_task.c) tell "never configured" from "configured but currently down".
  * Bounds-checks imu_index (false if out of range). */
 bool     idl0_imu_i2c_init_attempted(uint8_t imu_index);
+/* WHO_AM_I probe result of the last idl0_imu_init_one_i2c() for this index
+ * (NO_RESPONSE covers an absent pod). NOT_RUN if never initialised. */
+idl0_imu_probe_t idl0_imu_probe_result_i2c(uint8_t imu_index);
 uint16_t idl0_imu_fifo_count_i2c(uint8_t imu_index);
 bool     idl0_imu_pop_sample_i2c(uint8_t imu_index, idl0_imu_sample_t *out);
 bool     idl0_imu_check_overrun_i2c(uint8_t imu_index);

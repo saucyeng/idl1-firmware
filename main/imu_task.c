@@ -20,8 +20,9 @@
 #include "idl0_config.h"
 #include "idl0_format.h"
 #include "imu_driver.h"
-#include "imu_driver_i2c.h"   /* TEMP: I²C path for external IMUs */
+#include "imu_driver_i2c.h"
 #include "mode_state.h"
+#include "pins.h"
 #include "session.h"
 #include "writer_task.h"
 
@@ -35,23 +36,39 @@
 
 static const char *TAG = "imu_task";
 
-/* TEMP: per-IMU bus selection. IMU0 is the onboard LSM6DSO32 wired
- * direct to the C6 — stays on SPI via [imu_driver.c]. IMU1 and IMU2
- * are Adafruit 4692 breakouts whose passive level shifter blocks
- * push-pull SPI; they run on I²C via [imu_driver_i2c.c]. Remove this
- * table, the dispatch helpers below, and the I²C branch in
- * idl0_imu_task_start() once the external boards are reworked. */
+/* Per-IMU bus selection (IDL1). IMU0 is the onboard IMU on the shared SPI
+ * bus ([imu_driver.c], CS = IDL1_PIN_CS_IMU0). IMU1/IMU2 are the front/rear
+ * pods on the shared I2C bus ([imu_driver_i2c.c]) at the JP1-strapped
+ * addresses from pins.h (decisions.md P7-H3). The SPI driver has no
+ * chip-select for indices 1/2 and refuses them. */
 typedef enum { IDL0_BUS_SPI, IDL0_BUS_I2C } idl0_imu_bus_t;
 static const idl0_imu_bus_t s_imu_bus[IDL0_IMU_COUNT] = {
-    IDL0_BUS_SPI,   /* IMU0 — onboard, direct SPI */
-    IDL0_BUS_I2C,   /* IMU1 — external 4692, I²C @ 0x6A (AD0 jumper open) */
-    IDL0_BUS_I2C,   /* IMU2 — external 4692, I²C @ 0x6B (close AD0 jumper) */
+    IDL0_BUS_SPI,   /* IMU0 — onboard, SPI */
+    IDL0_BUS_I2C,   /* IMU1 — front pod, I2C */
+    IDL0_BUS_I2C,   /* IMU2 — rear pod, I2C */
 };
 static const uint8_t s_imu_i2c_addr[IDL0_IMU_COUNT] = {
-    0,      /* IMU0 not on I²C */
-    0x6A,   /* IMU1 — board ships with AD0 open */
-    0x6B,   /* IMU2 — requires AD0 solder jumper closed on this board */
+    0,                          /* IMU0 not on I2C */
+    IDL1_I2C_ADDR_IMU_FRONT,    /* IMU1 — 0x6A, JP1 open */
+    IDL1_I2C_ADDR_IMU_REAR,     /* IMU2 — 0x6B, JP1 closed */
 };
+
+/* WHO_AM_I probe result for IMU i, from whichever driver owns its bus. */
+static inline idl0_imu_probe_t imu_probe(uint8_t i) {
+    return s_imu_bus[i] == IDL0_BUS_I2C
+        ? idl0_imu_probe_result_i2c(i)
+        : idl0_imu_probe_result(i);
+}
+
+/* Bring-up phase 1: an LSM6DSV320X answered WHO_AM_I but the DSO32 driver
+ * declined to configure it. That is a known, healthy "present, not driven
+ * yet" state — not an IMU fault — so the status aggregate and the
+ * session-start re-init both skip it. */
+static inline bool imu_detected_not_driven(uint8_t i) {
+    const idl0_imu_probe_t p = imu_probe(i);
+    return p.status == IDL0_IMU_PROBE_ANSWERED &&
+           p.who_am_i == IDL1_IMU_WHO_AM_I_DSV320X;
+}
 
 static inline bool imu_is_active(uint8_t i) {
     return s_imu_bus[i] == IDL0_BUS_I2C
@@ -269,6 +286,7 @@ idl0_imu_state_t idl0_imu_task_state(void)
     int attempted = 0, ok_count = 0, error = 0;
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!s_imu_enabled[i]) continue;
+        if (imu_detected_not_driven(i)) continue;   /* phase 1: see helper */
         attempted++;
         if (s_imu_bus[i] == IDL0_BUS_I2C) {
             if (idl0_imu_is_active_i2c(i)) {
@@ -295,6 +313,7 @@ void idl0_imu_task_reinit_failed(void)
 {
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!s_imu_enabled[i]) continue;
+        if (imu_detected_not_driven(i)) continue;   /* nothing to recover */
 
         if (s_imu_bus[i] == IDL0_BUS_I2C) {
             if (idl0_imu_is_active_i2c(i)) continue;        /* already healthy */
@@ -316,6 +335,14 @@ void idl0_imu_task_reinit_failed(void)
                      (unsigned)i, ok ? "recovered" : "still down");
         }
     }
+}
+
+idl0_imu_probe_t idl0_imu_task_probe(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) {
+        return (idl0_imu_probe_t){ .status = IDL0_IMU_PROBE_NOT_RUN };
+    }
+    return imu_probe(imu_index);
 }
 
 static void emit_diag_log(int64_t now_us)
@@ -421,7 +448,7 @@ bool idl0_imu_task_start(void)
     /* Initialise every IMU the config has enabled. Each call is
      * independent — a missing or unresponsive IMU does not block
      * its siblings, the aggregate state just reflects PARTIAL.
-     * Bus selection per s_imu_bus[] above (TEMP). */
+     * Bus selection per s_imu_bus[] above. */
     int up = 0;
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!cfg.imu_enabled[i]) continue;

@@ -37,6 +37,24 @@ typedef enum {
     IDL0_IMU_ERROR,
 } idl0_imu_state_t;
 
+/* WHO_AM_I (0x0F) of the LSM6DSV320X fitted at every IDL1 IMU position.
+ * The drivers in this repo are still the LSM6DSO32 ones (WHO_AM_I 0x6C):
+ * on 0x73 they record the chip as present and decline to configure it — the
+ * DSV320X driver port lands in bring-up phase 2. */
+#define IDL1_IMU_WHO_AM_I_DSV320X 0x73
+
+/* Outcome of an IMU's WHO_AM_I read at init, per IMU index. */
+typedef enum {
+    IDL0_IMU_PROBE_NOT_RUN = 0,  /* init never attempted for this index */
+    IDL0_IMU_PROBE_NO_RESPONSE,  /* bus error / address NACK on the read */
+    IDL0_IMU_PROBE_ANSWERED,     /* read completed; value in who_am_i */
+} idl0_imu_probe_status_t;
+
+typedef struct {
+    idl0_imu_probe_status_t status;
+    uint8_t who_am_i;  /* raw WHO_AM_I byte; valid only when ANSWERED */
+} idl0_imu_probe_t;
+
 /* One drained sample, ready to be timestamped + framed by imu_task. */
 typedef struct {
     int16_t accel[3];  /* X, Y, Z — raw int16 LSB, no scaling */
@@ -64,9 +82,12 @@ bool idl0_imu_is_active(uint8_t imu_index);
 idl0_imu_state_t idl0_imu_per_state(uint8_t imu_index);
 
 /* Initialise one IMU (by index 0..IDL0_IMU_COUNT-1) on the shared SPI
- * host: add the device with its CS pin (per pins.h), verify WHO_AM_I
- * (0x6C), configure accel + gyro at the given ODR / range / mode,
- * enable FIFO continuous + BDR equal to ODR.
+ * host: add the device with its CS pin (per pins.h), read WHO_AM_I before
+ * any register write, and only if it is 0x6C (LSM6DSO32) configure accel +
+ * gyro at the given ODR / range / mode and enable FIFO continuous + BDR
+ * equal to ODR. On IDL1 only IMU0 has a chip-select; indices 1/2 (I2C
+ * pods) are refused. WHO_AM_I 0x73 (LSM6DSV320X) is recorded and the chip
+ * left untouched — returns false with the state at ABSENT.
  *
  * `sample_rate_hz`: one of 12 / 13 / 26 / 52 / 104 / 208 / 416 / 833 / 1666.
  * `accel_range_g`:  4, 8, 16, or 32.
@@ -83,6 +104,10 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
                        uint8_t accel_range_g,
                        uint16_t gyro_range_dps,
                        bool high_performance);
+
+/* WHO_AM_I probe result of the last idl0_imu_init_one() for this index.
+ * NOT_RUN for out-of-range or never-initialised indices. */
+idl0_imu_probe_t idl0_imu_probe_result(uint8_t imu_index);
 
 /* Per-IMU FIFO_STATUS unread-words count (0..512). Returns 0 if this
  * IMU is not active. */

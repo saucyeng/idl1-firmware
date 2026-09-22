@@ -44,6 +44,7 @@ static bool           s_active[IDL0_IMU_COUNT];
  * idl0_imu_task_reinit_failed() in imu_task.c) tell "never configured" from
  * "configured but currently down", which s_active alone cannot. */
 static bool           s_init_attempted[IDL0_IMU_COUNT];
+static idl0_imu_probe_t s_probe[IDL0_IMU_COUNT];   /* WHO_AM_I per init */
 static bool           s_overrun_flag[IDL0_IMU_COUNT];
 static int16_t        s_pending_gyro[IDL0_IMU_COUNT][3];
 static bool           s_have_gyro[IDL0_IMU_COUNT];
@@ -170,39 +171,6 @@ static lsm6dso32x_fs_g_t gy_fs_enum(uint16_t dps)
     }
 }
 
-/* DIAG: same dump as imu_driver.c's diag_dump_one, but over I²C. Lets
- * us compare the IMU0 (SPI) and IMU1 (I²C) burst reads side-by-side
- * in the boot log to confirm the chip is now reachable. Remove with
- * the rest of the module. */
-static void diag_dump_one(uint8_t imu_index, uint8_t i2c_addr)
-{
-    if (!s_active[imu_index]) {
-        /* state isn't OK yet; still dump because we want to see what
-         * comes back even when WHO_AM_I is about to fail. */
-    }
-    stmdev_ctx_t *ctx = &s_ctx[imu_index];
-    uint8_t buf[32] = {0};
-    int32_t r_burst = lsm6dso32x_read_reg(ctx, 0x00, buf, sizeof(buf));
-    uint8_t test_val = 0xA5, readback = 0xEE, zero = 0;
-    int32_t w_rc = lsm6dso32x_write_reg(ctx, 0x73, &test_val, 1);
-    int32_t r_rc = lsm6dso32x_read_reg(ctx,  0x73, &readback, 1);
-    lsm6dso32x_write_reg(ctx, 0x73, &zero, 1);
-    ESP_LOGW(TAG, "IMU%u(I²C@0x%02X) DIAG burst 0x00+32 (rc=%ld): "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X",
-             (unsigned)imu_index, i2c_addr, (long)r_burst,
-             buf[0],  buf[1],  buf[2],  buf[3],  buf[4],  buf[5],  buf[6],  buf[7],
-             buf[8],  buf[9],  buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-             buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-             buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]);
-    ESP_LOGW(TAG, "IMU%u(I²C@0x%02X) DIAG WHO_AM_I (burst[0x0F])=0x%02X (expect 0x6C); "
-                  "X_OFS_USR write 0xA5 → readback 0x%02X (w_rc=%ld r_rc=%ld)",
-             (unsigned)imu_index, i2c_addr, buf[0x0F],
-             readback, (long)w_rc, (long)r_rc);
-}
-
 /* --- Public API --- */
 
 /* T29: checks an ST-driver config-write's int32_t return. On failure, logs
@@ -235,6 +203,7 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
         return false;
     }
     s_init_attempted[imu_index] = true;
+    s_probe[imu_index] = (idl0_imu_probe_t){ .status = IDL0_IMU_PROBE_NO_RESPONSE };
     i2c_master_bus_handle_t bus = idl1_i2c_bus_get();
     if (bus == NULL) return false;
 
@@ -254,12 +223,27 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
         s_i2c[imu_index].dev = NULL;
     }
 
+    /* Address-only probe of this one address first (not a scan): an
+     * unplugged pod is a normal configuration (P7-H3), and probing avoids
+     * the I2C driver's NACK error log that a register read would trigger. */
+    esp_err_t err = i2c_master_probe(bus, i2c_addr, I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NOT_FOUND) {
+            ESP_LOGI(TAG, "IMU%u pod absent: no ACK at I2C 0x%02X",
+                     (unsigned)imu_index, i2c_addr);
+        } else {
+            ESP_LOGW(TAG, "IMU%u probe at I2C 0x%02X: %s (bus stuck / pull-ups?)",
+                     (unsigned)imu_index, i2c_addr, esp_err_to_name(err));
+        }
+        return false;
+    }
+
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address  = i2c_addr,
         .scl_speed_hz    = IDL1_I2C_SCL_HZ,
     };
-    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg,
+    err = i2c_master_bus_add_device(bus, &dev_cfg,
                                               &s_i2c[imu_index].dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IMU%u(I²C@0x%02X) bus_add_device: %s",
@@ -273,12 +257,30 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
     ctx->mdelay    = platform_mdelay;
     ctx->handle    = &s_i2c[imu_index];
 
-    diag_dump_one(imu_index, i2c_addr);
-
+    /* WHO_AM_I is the first register access — nothing is written to the
+     * chip before the part is identified (a DSO32 register write to a
+     * DSV320X lands on a different register). */
     uint8_t who = 0;
-    if (lsm6dso32x_device_id_get(ctx, &who) != 0 || who != IMU_WHO_AM_I) {
-        ESP_LOGW(TAG, "IMU%u(I²C@0x%02X) WHO_AM_I mismatch: got 0x%02X, expected 0x%02X",
-                 (unsigned)imu_index, i2c_addr, who, IMU_WHO_AM_I);
+    if (lsm6dso32x_device_id_get(ctx, &who) != 0) {
+        ESP_LOGW(TAG, "IMU%u(I²C@0x%02X) ACKed the probe but WHO_AM_I read failed",
+                 (unsigned)imu_index, i2c_addr);
+        i2c_master_bus_rm_device(s_i2c[imu_index].dev);
+        s_i2c[imu_index].dev = NULL;
+        return false;
+    }
+    s_probe[imu_index].status   = IDL0_IMU_PROBE_ANSWERED;
+    s_probe[imu_index].who_am_i = who;
+    if (who != IMU_WHO_AM_I) {
+        if (who == IDL1_IMU_WHO_AM_I_DSV320X) {
+            ESP_LOGI(TAG, "IMU%u(I²C@0x%02X) WHO_AM_I=0x%02X: LSM6DSV320X present"
+                          " — driver port lands in phase 2; left unconfigured",
+                     (unsigned)imu_index, i2c_addr, who);
+        } else {
+            ESP_LOGW(TAG, "IMU%u(I²C@0x%02X) WHO_AM_I mismatch: got 0x%02X, "
+                          "expected 0x%02X (DSO32) or 0x%02X (DSV320X)",
+                     (unsigned)imu_index, i2c_addr, who, IMU_WHO_AM_I,
+                     IDL1_IMU_WHO_AM_I_DSV320X);
+        }
         i2c_master_bus_rm_device(s_i2c[imu_index].dev);
         s_i2c[imu_index].dev = NULL;
         return false;
@@ -346,6 +348,14 @@ bool idl0_imu_is_active_i2c(uint8_t imu_index)
 {
     if (imu_index >= IDL0_IMU_COUNT) return false;
     return s_active[imu_index];
+}
+
+idl0_imu_probe_t idl0_imu_probe_result_i2c(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) {
+        return (idl0_imu_probe_t){ .status = IDL0_IMU_PROBE_NOT_RUN };
+    }
+    return s_probe[imu_index];
 }
 
 /* T32/T31: was idl0_imu_init_one_i2c() ever called for this index? See

@@ -68,6 +68,7 @@ static spi_device_handle_t s_spi[IDL0_IMU_COUNT];
 static stmdev_ctx_t        s_ctx[IDL0_IMU_COUNT];
 static idl0_imu_state_t    s_per_state[IDL0_IMU_COUNT];
 static bool                s_init_attempted[IDL0_IMU_COUNT];
+static idl0_imu_probe_t    s_probe[IDL0_IMU_COUNT];   /* WHO_AM_I per init */
 static bool                s_overrun_flag[IDL0_IMU_COUNT];
 static int16_t             s_pending_gyro[IDL0_IMU_COUNT][3];
 static bool                s_have_gyro[IDL0_IMU_COUNT];
@@ -217,50 +218,14 @@ static lsm6dso32x_fs_g_t gy_fs_enum(uint16_t dps)
     }
 }
 
-/* --- Diagnostic --------------------------------------------------
- * Dumps a 32-byte burst from register 0x00 plus a write-readback test
- * to a scratch user-offset register. Runs once per init attempt just
- * before the WHO_AM_I check so IMU0 (passing) and IMU1/IMU2 (failing)
- * produce side-by-side dumps for comparison.
- *
- * Interpretation:
- *   - burst byte[0x0F] = 0x6C → chip is alive and SPI addressing works
- *   - all-zero burst, write-readback returns 0x00 not 0xA5 → chip is
- *     receiving commands but its MOSI input is dead (sees 0xFF, reads
- *     register 0x7F into a sea of zero-default offsets)
- *   - burst differs between IMU0 and IMU1 in a structured way → bus
- *     framing problem (clock phase / first-bit misalignment)
- * TODO(idl0): remove once IMU1/IMU2 silence is diagnosed.
- */
-static void diag_dump_one(uint8_t imu_index)
+/* Hand an IMU chip-select back to plain GPIO, driven high (deasserted).
+ * spi_bus_remove_device() only disables the pad's output, which would leave
+ * the CS floating: a DSV320X that reads it as low joins SD traffic on the
+ * shared bus and can drive MISO. Same reasoning as app_main's CS pre-idle. */
+static void spi_cs_park(gpio_num_t cs)
 {
-    if (s_spi[imu_index] == NULL) return;
-    stmdev_ctx_t *ctx = &s_ctx[imu_index];
-
-    uint8_t buf[32] = {0};
-    int32_t r_burst = lsm6dso32x_read_reg(ctx, 0x00, buf, sizeof(buf));
-
-    uint8_t test_val = 0xA5;
-    uint8_t readback = 0xEE;
-    int32_t w_rc = lsm6dso32x_write_reg(ctx, 0x73, &test_val, 1);
-    int32_t r_rc = lsm6dso32x_read_reg(ctx,  0x73, &readback, 1);
-    uint8_t zero = 0;
-    lsm6dso32x_write_reg(ctx, 0x73, &zero, 1);   /* restore */
-
-    ESP_LOGW(TAG, "IMU%u DIAG burst 0x00+32 (rc=%ld): "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X "
-                  "%02X %02X %02X %02X %02X %02X %02X %02X",
-             (unsigned)imu_index, (long)r_burst,
-             buf[0],  buf[1],  buf[2],  buf[3],  buf[4],  buf[5],  buf[6],  buf[7],
-             buf[8],  buf[9],  buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-             buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-             buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]);
-    ESP_LOGW(TAG, "IMU%u DIAG WHO_AM_I byte (burst[0x0F])=0x%02X (expect 0x6C); "
-                  "X_OFS_USR write 0xA5 → readback 0x%02X (w_rc=%ld r_rc=%ld)",
-             (unsigned)imu_index, buf[0x0F],
-             readback, (long)w_rc, (long)r_rc);
+    gpio_set_level(cs, 1);
+    gpio_set_direction(cs, GPIO_MODE_OUTPUT);
 }
 
 /* --- Public API -------------------------------------------------- */
@@ -352,6 +317,7 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
 
     s_init_attempted[imu_index] = true;
     s_per_state[imu_index]      = IDL0_IMU_ABSENT;
+    s_probe[imu_index]          = (idl0_imu_probe_t){ .status = IDL0_IMU_PROBE_NOT_RUN };
 
     /* T31 re-runs init at session start to recover a live-faulted IMU; a
      * prior attempt may have left a device handle attached to the bus (e.g.
@@ -377,6 +343,7 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IMU%u spi_bus_add_device: %s",
                  (unsigned)imu_index, esp_err_to_name(err));
+        s_probe[imu_index].status = IDL0_IMU_PROBE_NO_RESPONSE;
         return false;
     }
 
@@ -386,14 +353,34 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
     ctx->mdelay    = platform_mdelay;
     ctx->handle    = &s_spi[imu_index];
 
-    diag_dump_one(imu_index);
-
+    /* WHO_AM_I is the first access to the chip — nothing is written to it
+     * before the part is identified (a DSO32 register write to a DSV320X
+     * lands on a different register). */
     uint8_t who = 0;
-    if (lsm6dso32x_device_id_get(ctx, &who) != 0 || who != IMU_WHO_AM_I) {
-        ESP_LOGW(TAG, "IMU%u WHO_AM_I mismatch: got 0x%02X, expected 0x%02X",
-                 (unsigned)imu_index, who, IMU_WHO_AM_I);
+    if (lsm6dso32x_device_id_get(ctx, &who) != 0) {
+        s_probe[imu_index].status = IDL0_IMU_PROBE_NO_RESPONSE;
+        ESP_LOGW(TAG, "IMU%u WHO_AM_I read failed (SPI error)", (unsigned)imu_index);
         spi_bus_remove_device(s_spi[imu_index]);
         s_spi[imu_index] = NULL;
+        spi_cs_park(s_cs_pin[imu_index]);
+        return false;
+    }
+    s_probe[imu_index].status   = IDL0_IMU_PROBE_ANSWERED;
+    s_probe[imu_index].who_am_i = who;
+    if (who != IMU_WHO_AM_I) {
+        if (who == IDL1_IMU_WHO_AM_I_DSV320X) {
+            ESP_LOGI(TAG, "IMU%u WHO_AM_I=0x%02X: LSM6DSV320X present — "
+                          "driver port lands in phase 2; left unconfigured",
+                     (unsigned)imu_index, who);
+        } else {
+            ESP_LOGW(TAG, "IMU%u WHO_AM_I mismatch: got 0x%02X, expected 0x%02X"
+                          " (DSO32) or 0x%02X (DSV320X)",
+                     (unsigned)imu_index, who, IMU_WHO_AM_I,
+                     IDL1_IMU_WHO_AM_I_DSV320X);
+        }
+        spi_bus_remove_device(s_spi[imu_index]);
+        s_spi[imu_index] = NULL;
+        spi_cs_park(s_cs_pin[imu_index]);
         return false;
     }
 
@@ -458,6 +445,14 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
              (unsigned)gyro_range_dps,
              high_performance ? "HIGH_PERFORMANCE" : "LOW_NORMAL");
     return true;
+}
+
+idl0_imu_probe_t idl0_imu_probe_result(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) {
+        return (idl0_imu_probe_t){ .status = IDL0_IMU_PROBE_NOT_RUN };
+    }
+    return s_probe[imu_index];
 }
 
 uint16_t idl0_imu_fifo_count(uint8_t imu_index)
