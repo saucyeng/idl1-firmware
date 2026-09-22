@@ -109,6 +109,14 @@ cc -std=c99 -I../main test_ota_guard.c ../main/ota_guard.c -o test_ota_guard
 ./test_ota_guard
 ```
 
+The LSM6DSV320X value sets and registry sensitivities (`main/imu_ranges.c`)
+likewise — run it whenever you touch the IMU config ladders or scales:
+
+```
+cc -std=c99 -I../main test_imu_ranges.c ../main/imu_ranges.c -o test_imu_ranges
+./test_imu_ranges
+```
+
 `test_gps_nmea.c` documents expected byte-level NMEA parsing behavior but
 does **not** link yet — `gps_driver.c` still mixes the pure parser with
 UART/log calls. It's inspection-verified only until the parser is extracted

@@ -38,15 +38,18 @@ typedef struct {
     bool is_full_suspension;
     uint8_t imu_count;       /* 1..3 */
 
-    /* IMU global */
+    /* IMU global. One rate shared by all three IMUs (R5), Hz:
+     * {15, 30, 60, 120, 240, 480, 960, 1920, 3840, 7680}, default 480. */
     uint16_t imu_sample_rate_hz;
     bool low_power_mode;
     bool high_performance_mode;
 
-    /* Per-IMU full-scale ranges (one entry per IMU index 0/1/2).
-     * Valid accel values: 4, 8, 16, 32 (g).
-     * Valid gyro values: 125, 250, 500, 1000, 2000 (dps).
-     * Defaults: 32 g / 2000 dps for all three IMUs.
+    /* Per-IMU full-scale ranges (one entry per IMU index 0/1/2), LSM6DSV320X
+     * low-g / gyro (imu_ranges.h):
+     * Valid accel values: 2, 4, 8, 16 (g).
+     * Valid gyro values: 250, 500, 1000, 2000, 4000 (dps).
+     * Defaults: 16 g / 2000 dps for all three IMUs. Off-list values are
+     * rejected per field at load, keeping the previous value (P2/P3).
      * Config source: imu.imuN.accel_range_g / imu.imuN.gyro_range_dps;
      * top-level imu.accel_range_g seeds all three slots before per-IMU
      * values override (back-compat with configs that lack per-IMU blocks). */

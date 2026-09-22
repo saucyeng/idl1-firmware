@@ -24,6 +24,7 @@
 #include "hrm_task.h"
 #include "idl0_config.h"
 #include "idl0_format.h"
+#include "imu_ranges.h"
 #include "imu_task.h"
 #include "led_status.h"
 #include "mode_state.h"
@@ -151,8 +152,8 @@ bool idl0_session_start(void)
         e->data_type       = 4;   /* i16 */
         e->sample_rate_hz  = cfg.imu_sample_rate_hz;
         e->scale = is_gyro
-            ? (float)cfg.gyro_range_dps[imu_index] / 32768.0f
-            : (float)cfg.accel_range_g[imu_index]  / 32768.0f;
+            ? idl1_imu_gyro_dps_per_lsb(cfg.gyro_range_dps[imu_index])
+            : idl1_imu_accel_g_per_lsb(cfg.accel_range_g[imu_index]);
         e->offset = 0.0f;
         /* name and units: zero-filled by memset; strncpy leaves the rest 0. */
         strncpy((char *)e->name,  s_imu_axis_meta[bit].name,  sizeof(e->name)  - 1);
