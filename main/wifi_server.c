@@ -3,9 +3,11 @@
 
 #include "wifi_server.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "esp_app_desc.h"
+#include "esp_app_format.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -33,6 +35,7 @@
 #include "idl0_config.h"
 #include "mode_state.h"
 #include "ota.h"
+#include "ota_guard.h"
 #include "sd_logger.h"
 
 static const char *TAG = "wifi";
@@ -381,6 +384,56 @@ static esp_err_t config_post_handler(httpd_req_t *req)
  * first one, since a single slow-but-alive chunk is normal under load. */
 #define IDL0_OTA_MAX_CONSEC_TIMEOUTS 3
 
+/* ota_guard.c is ESP-IDF-free for host testing, so it restates the image
+ * layout; pin it to the real structs here. */
+_Static_assert(sizeof(esp_image_header_t) == IDL1_OTA_IMAGE_HDR_BYTES,
+               "esp_image_header_t size");
+_Static_assert(sizeof(esp_image_segment_header_t) == IDL1_OTA_SEGMENT_HDR_BYTES,
+               "esp_image_segment_header_t size");
+_Static_assert(sizeof(esp_app_desc_t) == IDL1_OTA_APP_DESC_BYTES,
+               "esp_app_desc_t size");
+_Static_assert(IDL1_OTA_APP_DESC_OFFSET + offsetof(esp_app_desc_t, project_name) ==
+               IDL1_OTA_PROJECT_NAME_OFFSET, "project_name offset");
+_Static_assert(sizeof(((esp_app_desc_t *)0)->project_name) == IDL1_OTA_PROJECT_NAME_BYTES,
+               "project_name size");
+_Static_assert(ESP_IMAGE_HEADER_MAGIC == IDL1_OTA_IMAGE_MAGIC, "image magic");
+_Static_assert(ESP_APP_DESC_MAGIC_WORD == IDL1_OTA_APP_DESC_MAGIC, "app desc magic");
+
+/* F5 board guard: decide on the buffered image header whether this upload
+ * may touch flash at all. Returns true to proceed; on false the HTTP error
+ * has been sent and nothing has been written or erased. */
+static bool ota_guard_accept(httpd_req_t *req, const uint8_t *hdr, size_t len)
+{
+    const char *mine = esp_app_get_description()->project_name;
+    char theirs[IDL1_OTA_PROJECT_NAME_BYTES + 1];
+    switch (idl1_ota_guard_check(hdr, len, mine, theirs, sizeof(theirs))) {
+        case IDL1_OTA_GUARD_OK:
+            return true;
+        case IDL1_OTA_GUARD_WRONG_PROJECT: {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "image is for project %s, this board runs %s",
+                     theirs[0] ? theirs : "(empty)", mine);
+            ESP_LOGE(TAG, "/ota rejected before any flash write: %s", msg);
+            idl0_diag_log_event("ota rejected: project %s", theirs);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+            return false;
+        }
+        case IDL1_OTA_GUARD_BAD_IMAGE:
+            ESP_LOGE(TAG, "/ota rejected: not an ESP32 app image (magic mismatch)");
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "not an ESP32 app image (bad image header)");
+            return false;
+        case IDL1_OTA_GUARD_NEED_MORE:
+        default:
+            ESP_LOGE(TAG, "/ota rejected: upload shorter than the image header "
+                          "(%u of %u bytes)", (unsigned)len,
+                     (unsigned)IDL1_OTA_GUARD_HDR_BYTES);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                                "image too short for an app header");
+            return false;
+    }
+}
+
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
     touch_http_activity();
@@ -404,18 +457,19 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         }
     }
 
-    idl0_ota_session_t *s = idl0_ota_begin(total);
-    if (s == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin failed");
-        return ESP_FAIL;
-    }
-
     char *buf = malloc(IDL0_OTA_CHUNK);
     if (buf == NULL) {
-        idl0_ota_abort(s);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "alloc failed");
         return ESP_FAIL;
     }
+
+    /* F5: nothing reaches flash — not even the partition erase inside
+     * idl0_ota_begin() — until the image header has been buffered and the
+     * board guard has accepted it. `s` stays NULL until then; the header
+     * may arrive split across any number of recv()s. */
+    uint8_t hdr[IDL1_OTA_GUARD_HDR_BYTES];
+    size_t hdr_len = 0;
+    idl0_ota_session_t *s = NULL;
 
     int consec_timeouts = 0;
     size_t received = 0;
@@ -425,7 +479,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         if (n == HTTPD_SOCK_ERR_TIMEOUT) {
             if (++consec_timeouts >= IDL0_OTA_MAX_CONSEC_TIMEOUTS) {
                 free(buf);
-                idl0_ota_abort(s);  /* releases the OTA handle */
+                idl0_ota_abort(s);  /* releases the OTA handle (NULL-safe) */
                 httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT,
                                     "upload stalled");
                 return ESP_FAIL;
@@ -439,7 +493,37 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         consec_timeouts = 0;  /* any successful recv resets the streak */
-        if (!idl0_ota_write(s, buf, (size_t)n)) {
+        received += (size_t)n;
+
+        size_t off = 0;
+        if (s == NULL) {
+            size_t take = sizeof(hdr) - hdr_len;
+            if (take > (size_t)n) take = (size_t)n;
+            memcpy(hdr + hdr_len, buf, take);
+            hdr_len += take;
+            off = take;
+            if (hdr_len < sizeof(hdr)) {
+                touch_http_activity();
+                continue;  /* header still incomplete */
+            }
+            if (!ota_guard_accept(req, hdr, hdr_len)) {
+                free(buf);
+                return ESP_FAIL;
+            }
+            s = idl0_ota_begin(total);
+            if (s == NULL) {
+                free(buf);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin failed");
+                return ESP_FAIL;
+            }
+            if (!idl0_ota_write(s, hdr, hdr_len)) {
+                free(buf);
+                idl0_ota_abort(s);
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash write failed");
+                return ESP_FAIL;
+            }
+        }
+        if ((size_t)n > off && !idl0_ota_write(s, buf + off, (size_t)n - off)) {
             free(buf);
             idl0_ota_abort(s);
             httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "flash write failed");
@@ -448,9 +532,14 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         /* A slow OTA upload is activity — same rationale as /download:
          * don't let the no-HTTP failsafe arm fire mid-stream. */
         touch_http_activity();
-        received += (size_t)n;
     }
     free(buf);
+
+    /* Stream ended before the guard could decide: nothing was written. */
+    if (s == NULL) {
+        ota_guard_accept(req, hdr, hdr_len);   /* sends the "too short" 400 */
+        return ESP_FAIL;
+    }
 
     /* If Content-Length was set, the upload must have delivered exactly
      * that many bytes. A short stream means the client closed the

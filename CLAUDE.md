@@ -101,6 +101,14 @@ cc -std=c99 -I../main test_idl0_format.c ../main/idl0_format.c -o test_idl0_form
 ./test_idl0_format
 ```
 
+The OTA board guard (`main/ota_guard.c`, decisions.md F5) has the same
+shape — run it whenever you touch the guard or the `/ota` handler:
+
+```
+cc -std=c99 -I../main test_ota_guard.c ../main/ota_guard.c -o test_ota_guard
+./test_ota_guard
+```
+
 `test_gps_nmea.c` documents expected byte-level NMEA parsing behavior but
 does **not** link yet — `gps_driver.c` still mixes the pure parser with
 UART/log calls. It's inspection-verified only until the parser is extracted

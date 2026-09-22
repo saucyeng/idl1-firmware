@@ -20,6 +20,7 @@ idf_component_register(
          "imu_task.c"
          "wifi_server.c"
          "ota.c"
+         "ota_guard.c"
          "hrm_task.c"
          "digital_task.c"
          "mode_state.c"
