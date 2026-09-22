@@ -359,10 +359,11 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 
     /* idl0_config.json is read at boot only (HRM enable/address set in
      * hrm_task_start, IMU ODR/ranges in idl0_imu_init_one), so reboot to apply
-     * the new config in full — no chasing which subsystem hot-reloads. The GPS
-     * module is UART-only with no power-enable GPIO (pins.h), so esp_restart()
-     * resets the SoC without cutting GPS power: the u-blox keeps its fix across
-     * the ~hundreds-of-ms reset. The 500 ms delay lets the 200 "ok" flush so
+     * the new config in full — no chasing which subsystem hot-reloads. On
+     * IDL1 the GPS sits on the PWR_EN-switched rail (pins.h); the reset
+     * releases GPIO2 until app_main drives it high again, so expect the rail
+     * (and the u-blox fix) to drop across the reset — unverified on hardware
+     * as of bring-up phase 1. The 500 ms delay lets the 200 "ok" flush so
      * the app confirms the push before the link drops; the app then
      * re-establishes BLE and lands back in idle mode. The device boots into
      * idle (WiFi off, no session) by default. */
