@@ -11,6 +11,10 @@ idf.py build
 idf.py -p COMx flash monitor       # COMx = the XIAO's USB port; Ctrl+] quits
 ```
 
+The partition table has two 1920 KB OTA slots (IDL0 had 1600 KB). Only a USB
+flash writes the table, never an OTA, and every IDL1 board gets its first
+flash over USB anyway, so the change costs nothing.
+
 Rebooting re-runs the report: press RESET or `Ctrl+T Ctrl+R` in the monitor.
 
 ## What healthy looks like

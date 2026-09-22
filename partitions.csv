@@ -1,4 +1,8 @@
-# ESP-IDF Partition Table — IDL1 (OTA enabled; 2x1920K app slots in 4MB flash. Table changes need a USB flash)
+# ESP-IDF Partition Table — IDL1 (dual OTA)
+# Two 1920 KB app slots: 0x20000 + 2 x 1920K = 3968K of the XIAO's 4 MB flash.
+# Grown from IDL0's 1600K when the IDL1 image reached 98% of a slot. IDL1
+# boards are always first-flashed over USB, which writes this table, so the
+# change costs nothing in the field. An OTA image never rewrites the table.
 # Name,   Type, SubType,  Offset,   Size,  Flags
 nvs,      data, nvs,      0x9000,   24K,
 phy_init, data, phy,      0xF000,   4K,
