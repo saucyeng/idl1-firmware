@@ -44,4 +44,6 @@ idf_component_register(
         esp_wifi esp_netif esp_event esp_http_server
         # OTA write + boot partition control (ota.c)
         app_update
+        # TLA2528 ADC / GPO expander: IDL1 board LEDs + pod analog
+        tla2528
 )

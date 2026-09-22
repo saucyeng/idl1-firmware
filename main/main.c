@@ -18,6 +18,7 @@
 #include "driver/gpio.h"
 #include "gps_task.h"
 #include "hrm_task.h"
+#include "i2c_bus.h"
 #include "idl0_config.h"
 #include "imu_task.h"
 #include "led_status.h"
@@ -28,9 +29,17 @@
 #include "writer_task.h"
 #include "status.h"
 #include "session.h"
+#include "tla2528.h"
 #include "wifi_server.h"
 
 static const char *TAG = "idl0";
+
+/* The tla2528 component carries its own copy of the board's channel wiring
+ * (it cannot include pins.h); keep the two in lockstep. */
+_Static_assert(TLA2528_CH_LED_RED == IDL1_TLA_CH_LED_RED, "TLA red LED channel");
+_Static_assert(TLA2528_CH_LED_GREEN == IDL1_TLA_CH_LED_GREEN, "TLA green LED channel");
+_Static_assert(TLA2528_CH_ANA_R == IDL1_TLA_CH_ANA_R, "TLA rear analog channel");
+_Static_assert(TLA2528_CH_ANA_F == IDL1_TLA_CH_ANA_F, "TLA front analog channel");
 
 /* Invoked from the BLE host task when a control command is written. */
 static uint8_t on_ble_command(idl0_ble_command_t cmd)
@@ -181,6 +190,18 @@ void app_main(void)
 
     if (!idl0_writer_init()) {
         ESP_LOGE(TAG, "writer init failed; logging will not work");
+    }
+
+    /* Shared I2C bus (TLA2528 + both pods), then the TLA2528 at its one
+     * expected address. Boot continues whatever happens here (H2): a silent
+     * TLA2528 only costs the analog inputs and the two board LEDs. */
+    i2c_master_bus_handle_t i2c_bus = idl1_i2c_bus_get();
+    if (i2c_bus == NULL) {
+        ESP_LOGE(TAG, "I2C bus init failed; pods and TLA2528 unavailable");
+    }
+    if (tla2528_init(i2c_bus, IDL1_I2C_ADDR_TLA)) {
+        /* Green = power (H1). Red (recording) stays off in phase 1. */
+        tla2528_led_set(false, true);
     }
 
     if (!idl0_imu_task_start()) {
