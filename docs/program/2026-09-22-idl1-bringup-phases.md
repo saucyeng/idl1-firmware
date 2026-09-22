@@ -25,6 +25,7 @@ the repo carries its own copy of the program docs under `docs/program/`.
 | R8 | decisions H2 "device-ID read" | The TLA2528 has no device-ID register (Table 8 ends at 0x12) | Probe = `SYSTEM_STATUS` single-register read; ACK plus the documented reserved-bit value counts as identity. Raw byte always logged. |
 | R9 | audit T53 | Ring-buffer budget was sized for 3 × 833 Hz. Phase 3 high-g adds 3 × `CHANNEL_SAMPLE` per triplet per pod | Phase 3 must re-check the writer ring budget before shipping high-g defaults. |
 | R10 | idl0-app firmware catalog | Pulls `saucyeng/idl0-firmware` releases → IDL0 image offered to IDL1 hardware | F5 OTA project-name guard, phase 1. |
+| R11 | `session.c:153` registry scale; PORT-CHECKLIST R15/A20 | Scale is `range/32768` and the checklist claims that matches the datasheet. **It does not for gyro**: ST G_So is 8.75/17.5/35/70/140 mdps/LSB for 250…4000 dps, i.e. 1.1468 × range/32768. Every gyro channel logged by IDL0 reads 12.8 % low in the app. High-g ±320 g is 10.417 mg/LSB, not 320/32768. Accel low-g and high-g ±32…256 g are fine. | Phase 2: registry scale from a datasheet sensitivity table (verified against `lsm6dsv320x.md` p.12 in idl1-hardware references), not from `range/32768`. The owner decides on an idl0-firmware backport and a spec §5.2 correction. |
 
 Still-open audit rows carried into this fork: **T38** (SD mutex `portMAX_DELAY`,
 unblocked by A7) and **T41** (A5 zero-filled IMU record) → phase 2. **T40**
