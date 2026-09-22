@@ -81,6 +81,28 @@ static void sd_refresh_capacity_mb(void)
     s_total_mb = (uint32_t)(total_bytes / (1024ULL * 1024ULL));
 }
 
+/* T38: longest wait for s_file_mutex, ms. The longest legitimate hold is
+ * the first-fix rename (fflush + fclose + rename + fopen) or an fsync — a
+ * few hundred ms on a slow card. Waiting forever (portMAX_DELAY) turned a
+ * wedged SD operation into a silent pipeline stall. */
+#define IDL0_SD_MUTEX_TIMEOUT_MS 3000
+
+/* Take s_file_mutex with the T38 bound. A timeout means an SD operation has
+ * wedged: mark the card ERROR so the writer's next append failure latches
+ * the A7 fault flag and the 1 Hz status timer stops the session and reports
+ * `SD: ERROR` (§10.2). Logged here — this is a fault event, not a per-sample
+ * path. */
+static bool file_lock(const char *op)
+{
+    if (xSemaphoreTake(s_file_mutex, pdMS_TO_TICKS(IDL0_SD_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        return true;
+    }
+    ESP_LOGE(TAG, "%s: SD file mutex not free after %d ms — SD marked ERROR",
+             op, IDL0_SD_MUTEX_TIMEOUT_MS);
+    s_state = IDL0_SD_ERROR;
+    return false;
+}
+
 idl0_sd_state_t idl0_sd_state(void) { return s_state; }
 
 const char *idl0_sd_state_str(idl0_sd_state_t state)
@@ -106,12 +128,13 @@ uint32_t idl0_sd_total_mb(void)
 
 bool idl0_sd_init(spi_host_device_t spi_host)
 {
-    /* Shared SPI bus — also used by the IMUs (P7). Initialised here
-     * because the SD card is the first device on it. */
+    /* Shared SPI bus — also used by the onboard IMU0 (the pod IMUs are on
+     * I2C on IDL1). Initialised here because the SD card is the first
+     * device on it. */
     spi_bus_config_t bus_cfg = {
-        .mosi_io_num     = IDL0_PIN_SPI_MOSI,
-        .miso_io_num     = IDL0_PIN_SPI_MISO,
-        .sclk_io_num     = IDL0_PIN_SPI_SCK,
+        .mosi_io_num     = IDL1_PIN_SPI_MOSI,
+        .miso_io_num     = IDL1_PIN_SPI_MISO,
+        .sclk_io_num     = IDL1_PIN_SPI_SCK,
         .quadwp_io_num   = -1,
         .quadhd_io_num   = -1,
         .max_transfer_sz = 4096,
@@ -132,7 +155,7 @@ bool idl0_sd_init(spi_host_device_t spi_host)
     };
 
     sdspi_device_config_t slot_cfg = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_cfg.gpio_cs  = IDL0_PIN_CS_SD;
+    slot_cfg.gpio_cs  = IDL1_PIN_CS_SD;   /* GPIO7 on IDL1 (was 23 = SCL now) */
     slot_cfg.host_id  = spi_host;
 
     sdmmc_host_t host  = SDSPI_HOST_DEFAULT();
@@ -176,7 +199,7 @@ bool idl0_sd_open_session(int64_t boot_ms)
      * depth close — the race that could produce a stray handle in the first
      * place is tracked and accepted separately. Same mutex as the rest of
      * this file's s_file access. */
-    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+    if (file_lock("open_session")) {
         if (s_file != NULL) {
             ESP_LOGW(TAG, "open_session: closing stray pre-existing file handle");
             fflush(s_file);
@@ -210,7 +233,7 @@ bool idl0_sd_append(const uint8_t *buf, size_t len)
         return false;
     }
     bool ok = false;
-    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+    if (file_lock("append")) {
         /* fwrite into the 16 KB stdio buffer only — no fflush here. stdio
          * writes through to the card a full cluster at a time, and the writer
          * task flushes on a ~1 Hz cadence (idl0_sd_flush) for durability. This
@@ -234,7 +257,7 @@ bool idl0_sd_flush(void)
         return false;
     }
     bool ok = false;
-    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+    if (file_lock("flush")) {
         /* Two-step durability commit under the file mutex:
          *   fflush — push the 16 KB stdio buffer through to FATFS (writes the
          *            pending data clusters to the card).
@@ -283,7 +306,7 @@ bool idl0_sd_rename_with_timestamp(int64_t utc_seconds)
              IDL0_SD_MOUNT_POINT "/sessions/%Y-%m-%d_%H-%M-%S.idl0", &tm_utc);
 
     bool ok = false;
-    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+    if (file_lock("rename")) {
         fflush(s_file);
         fclose(s_file);
         s_file = NULL;  /* null until reopen — no dangling pointer */
@@ -311,7 +334,7 @@ bool idl0_sd_close_session(void)
         return false;
     }
     bool ok;
-    if (xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+    if (file_lock("close_session")) {
         fflush(s_file);
         ok = (fclose(s_file) == 0);
         s_file = NULL;
@@ -326,7 +349,7 @@ bool idl0_sd_close_session(void)
 
 void idl0_sd_discard_session(void)
 {
-    if (s_file_mutex != NULL && xSemaphoreTake(s_file_mutex, portMAX_DELAY) == pdTRUE) {
+    if (s_file_mutex != NULL && file_lock("discard_session")) {
         /* T44: no fflush — the file is being discarded, not committed. */
         if (s_file != NULL) {
             fclose(s_file);

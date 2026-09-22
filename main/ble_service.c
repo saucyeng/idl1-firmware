@@ -654,3 +654,10 @@ bool idl0_ble_is_suspended(void)
 {
     return s_suspended;
 }
+
+bool idl0_ble_is_connected(void)
+{
+    /* u16 load of a NimBLE-host-task-owned value; single-core C6, cannot
+     * tear. Indication only (board LEDs). */
+    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+}

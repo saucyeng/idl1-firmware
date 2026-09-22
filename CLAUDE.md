@@ -1,8 +1,16 @@
-# CLAUDE.md — IDL0 Firmware Standing Orders
+# CLAUDE.md — IDL1 Firmware Standing Orders
 
-This repo builds the ESP32-C6 firmware only. It has no local spec copy —
-read `docs/README.md` first, then follow it to the relevant spec section(s)
-before touching code.
+This repo builds the ESP32-C6 firmware for the **IDL1** board only (forked
+from `idl0-firmware`, which is frozen for IDL0 hardware — decisions.md F1/F2).
+It has no local spec copy — read `docs/README.md` first, then follow it to
+the relevant spec section(s) before touching code.
+
+**Authority:** `docs/program/decisions.md` holds the owner's rulings and wins
+over every other doc here. **The plan** is
+`docs/program/2026-09-22-idl1-bringup-phases.md` (phases 1–3 and review
+corrections R1–R10). The spec pointer is unchanged: idl0-app's
+`docs/IDL0_SPEC.md` (the wire format, BLE contract, "IDL0" file magic and
+schema v3 stay as they are through phase 3 — decisions.md F3).
 
 ---
 
@@ -91,6 +99,22 @@ GPS/NMEA parsing:
 cd test
 cc -std=c99 -I../main test_idl0_format.c ../main/idl0_format.c -o test_idl0_format
 ./test_idl0_format
+```
+
+The OTA board guard (`main/ota_guard.c`, decisions.md F5) has the same
+shape — run it whenever you touch the guard or the `/ota` handler:
+
+```
+cc -std=c99 -I../main test_ota_guard.c ../main/ota_guard.c -o test_ota_guard
+./test_ota_guard
+```
+
+The LSM6DSV320X value sets and registry sensitivities (`main/imu_ranges.c`)
+likewise — run it whenever you touch the IMU config ladders or scales:
+
+```
+cc -std=c99 -I../main test_imu_ranges.c ../main/imu_ranges.c -o test_imu_ranges
+./test_imu_ranges
 ```
 
 `test_gps_nmea.c` documents expected byte-level NMEA parsing behavior but

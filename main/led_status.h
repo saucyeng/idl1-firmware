@@ -1,6 +1,7 @@
 /* Status LED helper.
  *
- * Wraps the one onboard LED (IDL0_PIN_LED, see pins.h — active-high).
+ * Wraps the XIAO onboard LED (IDL1_PIN_LED_ONBOARD, GPIO15, active-low —
+ * see pins.h). The IDL1 board LEDs are TLA2528 GPOs (tla2528_led_set()).
  * Patterns are 1-byte enums; the caller picks one and the module
  * manages timing internally via a FreeRTOS software timer.
  */

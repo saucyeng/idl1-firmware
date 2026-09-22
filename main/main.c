@@ -1,9 +1,9 @@
-/* IDL0 firmware entry point.
+/* IDL1 firmware entry point.
  *
- * P4 milestone: BLE control plane up. Boots, brings up the status LED
- * and the NimBLE GATT service, and dispatches received commands to a
- * handler that logs them and reflects logging state on the LED. Real
- * command behaviour (SD, sensors) arrives in P5+.
+ * Boot order (bring-up phase 1): switched-rail power (PWR_EN) first, then
+ * the MCU-only subsystems, then the buses and sensors on the switched rail,
+ * then BLE, and finally the one-block boot self-test report (bringup.c).
+ * BLE control commands are dispatched to on_ble_command() below.
  */
 
 #include <stdio.h>
@@ -13,11 +13,14 @@
 #include "freertos/task.h"
 
 #include "ble_service.h"
+#include "board_leds.h"
+#include "bringup.h"
 #include "device_id.h"
 #include "diag_log.h"
 #include "driver/gpio.h"
 #include "gps_task.h"
 #include "hrm_task.h"
+#include "i2c_bus.h"
 #include "idl0_config.h"
 #include "imu_task.h"
 #include "led_status.h"
@@ -28,9 +31,17 @@
 #include "writer_task.h"
 #include "status.h"
 #include "session.h"
+#include "tla2528.h"
 #include "wifi_server.h"
 
 static const char *TAG = "idl0";
+
+/* The tla2528 component carries its own copy of the board's channel wiring
+ * (it cannot include pins.h); keep the two in lockstep. */
+_Static_assert(TLA2528_CH_LED_RED == IDL1_TLA_CH_LED_RED, "TLA red LED channel");
+_Static_assert(TLA2528_CH_LED_GREEN == IDL1_TLA_CH_LED_GREEN, "TLA green LED channel");
+_Static_assert(TLA2528_CH_ANA_R == IDL1_TLA_CH_ANA_R, "TLA rear analog channel");
+_Static_assert(TLA2528_CH_ANA_F == IDL1_TLA_CH_ANA_F, "TLA front analog channel");
 
 /* Invoked from the BLE host task when a control command is written. */
 static uint8_t on_ble_command(idl0_ble_command_t cmd)
@@ -92,9 +103,52 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
     return ack;
 }
 
+/* Settle time after PWR_EN goes high before anything on the switched rail
+ * is touched, ms. Rounded envelope over: TPS22919 rail rise, LSM6DSV320X
+ * boot, gyro turn-on 40 ms, ATS601 <=1 ms, TLA2528 tPU <=5 ms
+ * (pod-firmware-plan.md PT17). A boot-sequencing constant, not a sensor
+ * setting. */
+#define IDL1_PWR_EN_SETTLE_MS 50
+
+/* Drive PWR_EN high and leave it there for the life of the firmware.
+ *
+ * U2 (TPS22919) switches +3V3 to every peripheral: GNSS, onboard IMU, SD,
+ * TLA2528 (and both board LEDs), both pods, Qwiic. Its ON input is a
+ * non-latching level with no pull on the net, so GPIO2 must be an actively
+ * driven output from here on. Nothing else in the firmware may reconfigure
+ * IDL1_PIN_PWR_EN — no gpio_reset_pin(), no direction change, no sleep
+ * path — or the whole board goes dark while the MCU keeps running.
+ *
+ * The level is set before the pin is switched to output so the pad never
+ * drives low on the way up. INPUT_OUTPUT rather than OUTPUT keeps the input
+ * buffer on so the boot self-test can read the pad back; it does not
+ * change what the pin drives. */
+static void idl1_power_rail_on(void)
+{
+    gpio_set_level(IDL1_PIN_PWR_EN, 1);
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << IDL1_PIN_PWR_EN,
+        .mode         = GPIO_MODE_INPUT_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&cfg);
+    gpio_set_level(IDL1_PIN_PWR_EN, 1);
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "IDL0 firmware boot");
+    /* First statement: power the switched rail. Everything that drives a
+     * line into a switched-rail chip (SPI chip-selects, SPI/I2C buses, the
+     * GPS UART) must wait for the settle below. Driving a CS high into an
+     * unpowered IMU/SD back-powers it through its input clamp diodes
+     * (bring-up correction R7), so the order is PWR_EN -> settle -> CS idle
+     * -> buses. */
+    idl1_power_rail_on();
+    vTaskDelay(pdMS_TO_TICKS(IDL1_PWR_EN_SETTLE_MS));
+
+    ESP_LOGI(TAG, "IDL1 firmware boot");
 
     idl0_device_id_init();
 
@@ -119,15 +173,14 @@ void app_main(void)
     }
     idl0_led_set(IDL0_LED_BLINK_SLOW);
 
-    /* Idle every SPI peripheral's CS line BEFORE bringing up the shared
-     * SPI bus. Without this, IMU1 / IMU2 CS pins (GPIO 21 / 22) sit
-     * high-Z at reset and the LSM6DSO32 chips read their floating CS as
-     * asserted, then drive MISO during SD card init — corrupting the
-     * SCR read and failing the mount with ESP_ERR_INVALID_RESPONSE.
-     * IMU0's CS is later re-claimed by the spi_master driver via
-     * spics_io_num; explicit pre-idling is harmless. */
+    /* Idle every SPI chip-select BEFORE bringing up the shared SPI bus, so
+     * no device reads a floating CS as asserted and drives MISO during SD
+     * card init (on IDL0 that corrupted the SCR read and failed the mount
+     * with ESP_ERR_INVALID_RESPONSE). On IDL1 only the onboard IMU0 and the
+     * SD card sit on SPI; IMU0's CS is later re-claimed by the spi_master
+     * driver via spics_io_num, so explicit pre-idling is harmless. */
     static const gpio_num_t cs_pins[] = {
-        IDL0_PIN_CS_IMU0, IDL0_PIN_CS_IMU1, IDL0_PIN_CS_IMU2,
+        IDL1_PIN_CS_IMU0, IDL1_PIN_CS_SD,
     };
     for (size_t i = 0; i < sizeof(cs_pins) / sizeof(cs_pins[0]); i++) {
         gpio_reset_pin(cs_pins[i]);
@@ -141,6 +194,19 @@ void app_main(void)
 
     if (!idl0_writer_init()) {
         ESP_LOGE(TAG, "writer init failed; logging will not work");
+    }
+
+    /* Shared I2C bus (TLA2528 + both pods), then the TLA2528 at its one
+     * expected address. Boot continues whatever happens here (H2): a silent
+     * TLA2528 only costs the analog inputs and the two board LEDs. */
+    i2c_master_bus_handle_t i2c_bus = idl1_i2c_bus_get();
+    if (i2c_bus == NULL) {
+        ESP_LOGE(TAG, "I2C bus init failed; pods and TLA2528 unavailable");
+    }
+    if (tla2528_init(i2c_bus, IDL1_I2C_ADDR_TLA)) {
+        /* Green = power (H1) from here; board_leds takes over the roles once
+         * BLE is up (below). */
+        tla2528_led_set(false, true);
     }
 
     if (!idl0_imu_task_start()) {
@@ -159,6 +225,9 @@ void app_main(void)
         idl0_status_publisher_start();
     }
 
+    /* Board LED roles (H1): green = power + wireless, red = recording. */
+    idl1_board_leds_start();
+
     /* HRM task picks up the saved address from idl0_config.json. NimBLE
      * is already initialised by idl0_ble_init above; the central role
      * uses the same host instance. No-op if HRM is disabled. */
@@ -172,6 +241,11 @@ void app_main(void)
      * long-session WiFi degradation. No-op without SD; skips itself during a
      * logging session so it never contends with session writes. */
     idl0_diag_log_init();
+
+    /* Last: the one-block boot self-test report (bring-up phase 1). Runs
+     * after everything above so it reports their boot results; takes
+     * IDL1_BRINGUP_WINDOW_MS to watch GPS traffic. */
+    idl1_bringup_report();
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));

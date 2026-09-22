@@ -14,40 +14,26 @@
 #include "esp_log.h"
 
 #include "idl0_format.h"
+#include "imu_ranges.h"
 #include "sd_logger.h"
 
 static const char *TAG = "config";
 
 #define CONFIG_MAX_BYTES 8192
 
-/* Clamp `value` to the nearest entry in `valid_set` (ascending, `count`
- * entries). Ties round toward the lower entry. Used for every §8 field with
- * a fixed hardware-defined set of legal values (LSM6DSO32 ODR/FS ladders) so
- * a bogus or negative JSON number can't reach the sensor init or the on-disk
- * registry unclamped. Logs field/given/applied on any change. */
-static int32_t clamp_to_set(const char *field, int32_t value,
-                             const int32_t *valid_set, size_t count)
+/* Off-list gate for the §8 fields with a fixed hardware value set (the
+ * LSM6DSV320X ODR / full-scale ladders, imu_ranges.h). decisions.md P2/P3:
+ * an off-list value is rejected — logged once here, per field, per load —
+ * and the value already in the struct (the default, or the top-level seed
+ * for a per-IMU field) is kept. Never remapped to a nearest neighbour.
+ * Returns `valid`. */
+static bool accept_or_reject(const char *field, int32_t value, bool valid)
 {
-    /* Distance math runs in int64_t: cJSON saturates an out-of-int32-range
-     * JSON number to INT32_MIN/INT32_MAX rather than rejecting it, so
-     * `value` can arrive at either extreme from an untrusted BLE config
-     * push. `v - value` (or the reverse) on two int32_t at opposite
-     * extremes overflows int32_t, which is UB — widen before subtracting. */
-    int32_t best = valid_set[0];
-    int64_t best_dist = (value > best) ? ((int64_t)value - best) : ((int64_t)best - value);
-    for (size_t i = 1; i < count; i++) {
-        int32_t v = valid_set[i];
-        int64_t dist = (value > v) ? ((int64_t)value - v) : ((int64_t)v - value);
-        if (dist < best_dist) {
-            best = v;
-            best_dist = dist;
-        }
+    if (!valid) {
+        ESP_LOGW(TAG, "%s: %ld is not supported by the LSM6DSV320X — rejected, "
+                      "keeping the previous value", field, (long)value);
     }
-    if (best != value) {
-        ESP_LOGW(TAG, "%s: invalid value %ld, clamped to %ld",
-                 field, (long)value, (long)best);
-    }
-    return best;
+    return valid;
 }
 
 /* Clamp `value` to [lo, hi] (inclusive). Used for §8 fields the spec leaves
@@ -64,18 +50,6 @@ static int32_t clamp_to_range(const char *field, int32_t value,
     return clamped;
 }
 
-/* LSM6DSO32 ODR ladder (Hz), spec §8. The sensor's true rates are
- * 12.5/26/52/104/208/416/833/1666 Hz; JSON carries integers only, so 12.5 is
- * represented as 12 here — 13 is NOT accepted as 12.5-intent, it clamps to
- * the nearest listed integer like any other invalid value. */
-static const int32_t IMU_SAMPLE_RATE_SET[] = { 12, 26, 52, 104, 208, 416, 833, 1666 };
-
-/* LSM6DSO32 accelerometer full-scale set (g), spec §8. */
-static const int32_t ACCEL_RANGE_SET[] = { 4, 8, 16, 32 };
-
-/* LSM6DSO32 gyroscope full-scale set (dps), spec §8. */
-static const int32_t GYRO_RANGE_SET[] = { 125, 250, 500, 1000, 2000 };
-
 /* All-IMU, all-axis mask (bits 0-17). */
 #define DEFAULT_IMU_MASK 0x0003FFFFu
 
@@ -85,13 +59,13 @@ static void fill_defaults(idl0_config_t *cfg)
     snprintf(cfg->bike_name, sizeof(cfg->bike_name), "%s", "Unconfigured");
     cfg->is_full_suspension   = true;
     cfg->imu_count            = 3;
-    cfg->imu_sample_rate_hz   = 104;
-    cfg->accel_range_g[0]     = 32;
-    cfg->accel_range_g[1]     = 32;
-    cfg->accel_range_g[2]     = 32;
-    cfg->gyro_range_dps[0]    = 2000;
-    cfg->gyro_range_dps[1]    = 2000;
-    cfg->gyro_range_dps[2]    = 2000;
+    cfg->imu_sample_rate_hz   = IDL1_IMU_DEFAULT_ODR_HZ;
+    cfg->accel_range_g[0]     = IDL1_IMU_DEFAULT_ACCEL_RANGE_G;
+    cfg->accel_range_g[1]     = IDL1_IMU_DEFAULT_ACCEL_RANGE_G;
+    cfg->accel_range_g[2]     = IDL1_IMU_DEFAULT_ACCEL_RANGE_G;
+    cfg->gyro_range_dps[0]    = IDL1_IMU_DEFAULT_GYRO_RANGE_DPS;
+    cfg->gyro_range_dps[1]    = IDL1_IMU_DEFAULT_GYRO_RANGE_DPS;
+    cfg->gyro_range_dps[2]    = IDL1_IMU_DEFAULT_GYRO_RANGE_DPS;
     cfg->high_performance_mode = true;
     cfg->imu_enabled[0] = cfg->imu_enabled[1] = cfg->imu_enabled[2] = true;
     cfg->gps_sample_rate_hz   = 5;
@@ -397,31 +371,28 @@ bool idl0_config_load(idl0_config_t *out_config)
     const cJSON *imu = cJSON_GetObjectItemCaseSensitive(root, "imu");
     if (cJSON_IsObject(imu)) {
         const cJSON *rate = cJSON_GetObjectItemCaseSensitive(imu, "sample_rate_hz");
-        if (cJSON_IsNumber(rate)) {
-            /* LSM6DSO32 ODR ladder (Hz) — see IMU_SAMPLE_RATE_SET above for
-             * the 12.5 Hz note. */
-            out_config->imu_sample_rate_hz = (uint16_t)clamp_to_set(
-                "imu.sample_rate_hz", rate->valueint,
-                IMU_SAMPLE_RATE_SET,
-                sizeof(IMU_SAMPLE_RATE_SET) / sizeof(IMU_SAMPLE_RATE_SET[0]));
+        if (cJSON_IsNumber(rate) &&
+            accept_or_reject("imu.sample_rate_hz", rate->valueint,
+                             idl1_imu_odr_valid(rate->valueint))) {
+            out_config->imu_sample_rate_hz = (uint16_t)rate->valueint;
         }
 
         /* Top-level accel_range_g / gyro_range_dps seed all three slots for
          * back-compat with config files that lack per-IMU sub-blocks. */
         const cJSON *arange_top = cJSON_GetObjectItemCaseSensitive(imu, "accel_range_g");
-        if (cJSON_IsNumber(arange_top)) {
-            uint8_t v = (uint8_t)clamp_to_set(
-                "imu.accel_range_g", arange_top->valueint,
-                ACCEL_RANGE_SET, sizeof(ACCEL_RANGE_SET) / sizeof(ACCEL_RANGE_SET[0]));
+        if (cJSON_IsNumber(arange_top) &&
+            accept_or_reject("imu.accel_range_g", arange_top->valueint,
+                             idl1_imu_accel_range_valid(arange_top->valueint))) {
+            const uint8_t v = (uint8_t)arange_top->valueint;
             out_config->accel_range_g[0] = v;
             out_config->accel_range_g[1] = v;
             out_config->accel_range_g[2] = v;
         }
         const cJSON *grange_top = cJSON_GetObjectItemCaseSensitive(imu, "gyro_range_dps");
-        if (cJSON_IsNumber(grange_top)) {
-            uint16_t v = (uint16_t)clamp_to_set(
-                "imu.gyro_range_dps", grange_top->valueint,
-                GYRO_RANGE_SET, sizeof(GYRO_RANGE_SET) / sizeof(GYRO_RANGE_SET[0]));
+        if (cJSON_IsNumber(grange_top) &&
+            accept_or_reject("imu.gyro_range_dps", grange_top->valueint,
+                             idl1_imu_gyro_range_valid(grange_top->valueint))) {
+            const uint16_t v = (uint16_t)grange_top->valueint;
             out_config->gyro_range_dps[0] = v;
             out_config->gyro_range_dps[1] = v;
             out_config->gyro_range_dps[2] = v;
@@ -452,16 +423,16 @@ bool idl0_config_load(idl0_config_t *out_config)
                 out_config->imu_enabled[i] = cJSON_IsTrue(en);
             }
             const cJSON *ar = cJSON_GetObjectItemCaseSensitive(imu_blk, "accel_range_g");
-            if (cJSON_IsNumber(ar)) {
-                out_config->accel_range_g[i] = (uint8_t)clamp_to_set(
-                    "imu.imuN.accel_range_g", ar->valueint,
-                    ACCEL_RANGE_SET, sizeof(ACCEL_RANGE_SET) / sizeof(ACCEL_RANGE_SET[0]));
+            if (cJSON_IsNumber(ar) &&
+                accept_or_reject("imu.imuN.accel_range_g", ar->valueint,
+                                 idl1_imu_accel_range_valid(ar->valueint))) {
+                out_config->accel_range_g[i] = (uint8_t)ar->valueint;
             }
             const cJSON *gr = cJSON_GetObjectItemCaseSensitive(imu_blk, "gyro_range_dps");
-            if (cJSON_IsNumber(gr)) {
-                out_config->gyro_range_dps[i] = (uint16_t)clamp_to_set(
-                    "imu.imuN.gyro_range_dps", gr->valueint,
-                    GYRO_RANGE_SET, sizeof(GYRO_RANGE_SET) / sizeof(GYRO_RANGE_SET[0]));
+            if (cJSON_IsNumber(gr) &&
+                accept_or_reject("imu.imuN.gyro_range_dps", gr->valueint,
+                                 idl1_imu_gyro_range_valid(gr->valueint))) {
+                out_config->gyro_range_dps[i] = (uint16_t)gr->valueint;
             }
             const cJSON *channels_blk =
                 cJSON_GetObjectItemCaseSensitive(imu_blk, "channels");

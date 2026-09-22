@@ -16,7 +16,8 @@
 
 #include "imu_driver.h"   /* idl0_imu_state_t */
 
-/* Brings up IMU0 from config and starts the polling task. Idempotent. */
+/* Brings up every IMU the config enables and starts the polling task.
+ * Idempotent. */
 bool idl0_imu_task_start(void);
 
 /* Drain-instrumentation hooks for the session layer. The IMU task accumulates
@@ -33,6 +34,16 @@ void idl0_imu_diag_flush(void);
  * idl0_imu_state() (which only sees the SPI side). status.c calls this one
  * for the §7.3 "IMU:" status token. */
 idl0_imu_state_t idl0_imu_task_state(void);
+
+/* Is IMU `imu_index` configured and currently delivering data (per its
+ * bus's driver)? False for out-of-range indices. */
+bool idl0_imu_task_is_active(uint8_t imu_index);
+
+/* Boot WHO_AM_I probe result for IMU `imu_index` (0 = onboard SPI, 1 =
+ * front pod 0x6A, 2 = rear pod 0x6B), from the driver that owns its bus.
+ * NOT_RUN if the IMU is disabled in config or the index is out of range.
+ * Read by the boot self-test report (bringup.c). */
+idl0_imu_probe_t idl0_imu_task_probe(uint8_t imu_index);
 
 /* T31: re-run init once for every configured IMU currently latched down
  * (SPI ERROR / I²C inactive-after-attempt), using the same per-IMU config

@@ -9,10 +9,6 @@
 
 static const char *TAG = "led";
 
-/* XIAO ESP32-C6 onboard user LED is active-low (drive LOW to light).
- * See pins.h for why the onboard LED is used instead of the board's D1. */
-#define IDL0_LED_ACTIVE_LEVEL  0
-
 static TimerHandle_t s_blink_timer = NULL;
 static bool s_blink_phase = false;
 /* T16: set true only once idl0_led_init() fully succeeds (GPIO configured
@@ -24,7 +20,8 @@ static bool s_initialized = false;
 
 static void apply_level(bool on)
 {
-    gpio_set_level(IDL0_PIN_LED, on ? IDL0_LED_ACTIVE_LEVEL : !IDL0_LED_ACTIVE_LEVEL);
+    gpio_set_level(IDL1_PIN_LED_ONBOARD,
+                   on ? IDL1_LED_ONBOARD_ACTIVE_LEVEL : !IDL1_LED_ONBOARD_ACTIVE_LEVEL);
 }
 
 static void blink_cb(TimerHandle_t t)
@@ -37,7 +34,7 @@ static void blink_cb(TimerHandle_t t)
 bool idl0_led_init(void)
 {
     const gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << IDL0_PIN_LED,
+        .pin_bit_mask = 1ULL << IDL1_PIN_LED_ONBOARD,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,

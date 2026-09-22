@@ -20,38 +20,47 @@
 #include "idl0_config.h"
 #include "idl0_format.h"
 #include "imu_driver.h"
-#include "imu_driver_i2c.h"   /* TEMP: I²C path for external IMUs */
+#include "imu_driver_i2c.h"
+#include "imu_ranges.h"
 #include "mode_state.h"
+#include "pins.h"
 #include "session.h"
 #include "writer_task.h"
 
-#define IMU_POLL_MS            20    /* drain every 20 ms — keeps FIFO occupancy
-                                      * ~17 pairs at 833 Hz (was 50 ms → ~127
-                                      * pairs ≈ FIFO capacity = drops). */
-#define IMU_DRAIN_MAX_PAIRS    256   /* full LSM6DSO32X FIFO (256 pairs). Lets one
-                                      * drain fully recover after a stall instead
-                                      * of leaving residual to overflow. */
+#define IMU_POLL_MS            20    /* drain every 20 ms — ~10 pairs per drain
+                                      * at the 480 Hz default, ~39 at 1920 Hz;
+                                      * the 511-word FIFO holds ~255 pairs. */
+#define IMU_DRAIN_MAX_PAIRS    256   /* a full LSM6DSV320X FIFO (511 words = 255
+                                      * pairs + 1). Lets one drain fully recover
+                                      * after a stall instead of leaving residual
+                                      * to overflow. */
 #define IMU_DIAG_LOG_PERIOD_MS 5000  /* periodic serial "drained N pairs" log */
 
 static const char *TAG = "imu_task";
 
-/* TEMP: per-IMU bus selection. IMU0 is the onboard LSM6DSO32 wired
- * direct to the C6 — stays on SPI via [imu_driver.c]. IMU1 and IMU2
- * are Adafruit 4692 breakouts whose passive level shifter blocks
- * push-pull SPI; they run on I²C via [imu_driver_i2c.c]. Remove this
- * table, the dispatch helpers below, and the I²C branch in
- * idl0_imu_task_start() once the external boards are reworked. */
+/* Per-IMU bus selection (IDL1). IMU0 is the onboard IMU on the shared SPI
+ * bus ([imu_driver.c], CS = IDL1_PIN_CS_IMU0). IMU1/IMU2 are the front/rear
+ * pods on the shared I2C bus ([imu_driver_i2c.c]) at the JP1-strapped
+ * addresses from pins.h (decisions.md P7-H3). The SPI driver has no
+ * chip-select for indices 1/2 and refuses them. */
 typedef enum { IDL0_BUS_SPI, IDL0_BUS_I2C } idl0_imu_bus_t;
 static const idl0_imu_bus_t s_imu_bus[IDL0_IMU_COUNT] = {
-    IDL0_BUS_SPI,   /* IMU0 — onboard, direct SPI */
-    IDL0_BUS_I2C,   /* IMU1 — external 4692, I²C @ 0x6A (AD0 jumper open) */
-    IDL0_BUS_I2C,   /* IMU2 — external 4692, I²C @ 0x6B (close AD0 jumper) */
+    IDL0_BUS_SPI,   /* IMU0 — onboard, SPI */
+    IDL0_BUS_I2C,   /* IMU1 — front pod, I2C */
+    IDL0_BUS_I2C,   /* IMU2 — rear pod, I2C */
 };
 static const uint8_t s_imu_i2c_addr[IDL0_IMU_COUNT] = {
-    0,      /* IMU0 not on I²C */
-    0x6A,   /* IMU1 — board ships with AD0 open */
-    0x6B,   /* IMU2 — requires AD0 solder jumper closed on this board */
+    0,                          /* IMU0 not on I2C */
+    IDL1_I2C_ADDR_IMU_FRONT,    /* IMU1 — 0x6A, JP1 open */
+    IDL1_I2C_ADDR_IMU_REAR,     /* IMU2 — 0x6B, JP1 closed */
 };
+
+/* WHO_AM_I probe result for IMU i, from whichever driver owns its bus. */
+static inline idl0_imu_probe_t imu_probe(uint8_t i) {
+    return s_imu_bus[i] == IDL0_BUS_I2C
+        ? idl0_imu_probe_result_i2c(i)
+        : idl0_imu_probe_result(i);
+}
 
 static inline bool imu_is_active(uint8_t i) {
     return s_imu_bus[i] == IDL0_BUS_I2C
@@ -74,7 +83,7 @@ static inline void imu_take_pair_diag(uint8_t i, uint32_t *reuse, uint32_t *unkn
 }
 
 static TaskHandle_t s_task         = NULL;
-static uint16_t     s_odr_hz       = 104;
+static uint16_t     s_odr_hz       = IDL1_IMU_DEFAULT_ODR_HZ;
 static uint32_t     s_channel_mask = 0;
 
 /* Boot-time per-IMU config, persisted so idl0_imu_task_reinit_failed() (T31)
@@ -99,6 +108,13 @@ static int64_t  s_diag_last_log_us;
  * step ≤2 ms backwards at a drain boundary on the first-drained IMU). */
 static int64_t s_last_ts[IDL0_IMU_COUNT] = { INT64_MIN, INT64_MIN, INT64_MIN };
 
+/* T41 / decisions.md A5: which IMUs were active when the current session
+ * started. Snapshotted by imu_task_fn on the session's not-running ->
+ * running edge (this task is the only reader/writer). An IMU that was
+ * active then and has since dropped out emits one zero-filled IMU_SAMPLE per
+ * poll cycle, so the gap is explicit in the file rather than silent. */
+static bool s_active_at_session_start[IDL0_IMU_COUNT];
+
 /* Session drain instrumentation. Accumulated in RAM across a logging session
  * and emitted to the on-SD diag log (idl0_debug.log) by idl0_imu_diag_flush()
  * AFTER the session file closes — never written mid-session (§1: raw capture
@@ -122,14 +138,35 @@ static uint32_t s_m_writer_drops;
 static idl0_imu_sample_t s_pairs[IMU_DRAIN_MAX_PAIRS];
 static uint8_t           s_batch[IMU_DRAIN_MAX_PAIRS * 24];
 
+/* T41 / A5: one zero-filled IMU_SAMPLE for an IMU that was active at
+ * session start and is now down, timestamped at this poll. */
+static void emit_zero_record(uint8_t imu_index)
+{
+    int64_t ts = esp_timer_get_time();
+    if (ts <= s_last_ts[imu_index]) ts = s_last_ts[imu_index] + 1;
+    s_last_ts[imu_index] = ts;
+    static const int16_t zero_axes[6] = {0};
+    uint8_t rec[24];   /* max IMU_SAMPLE record size, bytes */
+    const size_t n = idl0_format_imu_sample(rec, imu_index, ts, s_channel_mask, zero_axes);
+    if (n > 0 && !idl0_writer_submit(rec, n)) {
+        s_m_writer_drops++;
+        s_diag_writer_drops++;
+    }
+}
+
 static void drain_one(uint8_t imu_index, int64_t period_us)
 {
-    if (!imu_is_active(imu_index)) return;
     /* T20: require mask has at least one channel bit set. No registry entries
      * exist for a maskless IMU — such records would be unexplainable overhead
      * (~12 bytes every ~20 ms for the session). */
     uint32_t imu_bits = (s_channel_mask >> (imu_index * 6)) & 0x3Fu;
     if (imu_bits == 0) return;
+    if (!imu_is_active(imu_index)) {
+        if (s_active_at_session_start[imu_index] && idl0_session_is_running()) {
+            emit_zero_record(imu_index);
+        }
+        return;
+    }
 
     /* Snapshot the read instant before draining so all per-sample
      * timestamps anchor on the same t_read for this IMU. */
@@ -227,8 +264,9 @@ void idl0_imu_diag_flush(void)
         uint32_t reuse = 0, unknown = 0;
         imu_take_pair_diag(i, &reuse, &unknown);
         idl0_diag_log_event(
-            "IMU%u %s drains=%lu pairs=%lu ovr=%lu reuse=%lu unk=%lu read_us=%lu/%lu tot_us=%lu/%lu",
+            "IMU%u %s odr_hz=%u drains=%lu pairs=%lu ovr=%lu reuse=%lu unk=%lu read_us=%lu/%lu tot_us=%lu/%lu",
             (unsigned)i, s_imu_bus[i] == IDL0_BUS_I2C ? "i2c" : "spi",
+            (unsigned)s_odr_hz,
             (unsigned long)s_m_drains[i], (unsigned long)s_m_pairs[i],
             (unsigned long)s_m_overruns[i],
             (unsigned long)reuse, (unsigned long)unknown,
@@ -318,6 +356,20 @@ void idl0_imu_task_reinit_failed(void)
     }
 }
 
+bool idl0_imu_task_is_active(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return false;
+    return imu_is_active(imu_index);
+}
+
+idl0_imu_probe_t idl0_imu_task_probe(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) {
+        return (idl0_imu_probe_t){ .status = IDL0_IMU_PROBE_NOT_RUN };
+    }
+    return imu_probe(imu_index);
+}
+
 static void emit_diag_log(int64_t now_us)
 {
     /* Show per-IMU pair counts + overruns since last log. Lets us
@@ -350,6 +402,7 @@ static void imu_task_fn(void *arg)
     s_diag_last_log_us = esp_timer_get_time();
     bool prev_wifi = (idl0_mode_get_bits() & IDL0_MODE_BIT_WIFI_UP) != 0;
     int64_t prev_cycle_us = 0;   /* start of the previous drain pass */
+    bool prev_running = false;   /* session state at the previous cycle */
 
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(IMU_POLL_MS));
@@ -372,6 +425,15 @@ static void imu_task_fn(void *arg)
             if (!wifi_up) s_diag_last_log_us = esp_timer_get_time();
         }
         if (wifi_up) continue;
+
+        /* T41: snapshot which IMUs are live as a session starts. */
+        const bool running = idl0_session_is_running();
+        if (running && !prev_running) {
+            for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+                s_active_at_session_start[i] = imu_is_active(i);
+            }
+        }
+        prev_running = running;
 
         const int64_t cycle_start_us = esp_timer_get_time();
         for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
@@ -421,7 +483,7 @@ bool idl0_imu_task_start(void)
     /* Initialise every IMU the config has enabled. Each call is
      * independent — a missing or unresponsive IMU does not block
      * its siblings, the aggregate state just reflects PARTIAL.
-     * Bus selection per s_imu_bus[] above (TEMP). */
+     * Bus selection per s_imu_bus[] above. */
     int up = 0;
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
         if (!cfg.imu_enabled[i]) continue;

@@ -302,12 +302,13 @@ bool idl0_gps_init(void)
         s_state = IDL0_GPS_ABSENT;
         return false;
     }
-    /* TX pin not wired on this board revision — pass UART_PIN_NO_CHANGE
-     * so the driver leaves TX unmapped. TODO(idl0): when the TX trace
-     * is reworked, set TX to IDL0_PIN_GPS_TX and emit UBX-CFG-* here. */
+    /* IDL1 wires host TX (IDL1_PIN_GPS_TX, GPIO16) to the module, but
+     * phase 1 sends nothing: TX stays unmapped (UART_PIN_NO_CHANGE) and the
+     * module runs at factory defaults, as on IDL0. TODO(idl0): map TX and
+     * emit UBX-CFG-* here once the GPS port lands (bring-up phase 2). */
     err = uart_set_pin(IDL0_GPS_UART,
                        UART_PIN_NO_CHANGE,   /* tx */
-                       IDL0_PIN_GPS_RX,      /* rx */
+                       IDL1_PIN_GPS_RX,      /* rx */
                        UART_PIN_NO_CHANGE,
                        UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
@@ -317,7 +318,7 @@ bool idl0_gps_init(void)
         return false;
     }
     s_state = IDL0_GPS_NOFIX;
-    ESP_LOGI(TAG, "GPS UART up on RX=%d @ %d baud (TX unwired)",
-             IDL0_PIN_GPS_RX, IDL0_GPS_BAUD);
+    ESP_LOGI(TAG, "GPS UART up on RX=%d @ %d baud (TX unmapped)",
+             IDL1_PIN_GPS_RX, IDL0_GPS_BAUD);
     return true;
 }

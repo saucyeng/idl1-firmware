@@ -1,4 +1,4 @@
-# IDL0 firmware main component.
+# IDL1 firmware main component.
 # Each module is added as a SRCS entry as it lands.
 
 idf_component_register(
@@ -16,20 +16,26 @@ idf_component_register(
          "gps_task.c"
          "imu_driver.c"
          "imu_driver_i2c.c"
+         "imu_chip_dsv320x.c"
+         "imu_ranges.c"
+         "i2c_bus.c"
          "imu_task.c"
          "wifi_server.c"
          "ota.c"
+         "ota_guard.c"
          "hrm_task.c"
          "digital_task.c"
          "mode_state.c"
          "diag_log.c"
+         "bringup.c"
+         "board_leds.c"
     INCLUDE_DIRS "."
     REQUIRES
         # SD card writer
         fatfs sdmmc esp_driver_sdspi
         # GPIO (LED, buttons) + UART (GPS)
         esp_driver_gpio esp_driver_uart
-        # TEMP: I²C master driver for external IMUs (imu_driver_i2c.c)
+        # I2C master driver: shared IDL1 bus (i2c_bus.c) — pod IMUs, TLA2528
         esp_driver_i2c
         # esp_timer_get_time (session), esp_random / esp_mac (device_id)
         esp_timer esp_hw_support
@@ -37,10 +43,14 @@ idf_component_register(
         bt nvs_flash
         # FreeRTOS ring buffer (writer_task.c — freertos/ringbuf.h)
         esp_ringbuf
-        # Vendored ST LSM6DSO32 driver (firmware/components/lsm6dso32x_STdC, pinned to v2.3.0)
-        lsm6dso32x_STdC
+        # Vendored ST LSM6DSV320X driver (components/lsm6dsv320x_STdC, pinned to v5.4.0)
+        lsm6dsv320x_STdC
         # WiFi AP + HTTP server (wifi_server.c)
         esp_wifi esp_netif esp_event esp_http_server
         # OTA write + boot partition control (ota.c)
         app_update
+        # TLA2528 ADC / GPO expander: IDL1 board LEDs + pod analog
+        tla2528
+        # Oneshot ADC + calibration: battery sense in the boot self-test (bringup.c)
+        esp_adc
 )

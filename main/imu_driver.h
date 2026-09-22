@@ -1,9 +1,10 @@
-/* LSM6DSO32 SPI driver — up to three IMUs on shared SPI2_HOST.
+/* LSM6DSV320X IMUs — shared types and the SPI (onboard IMU0) API.
  *
- * The shared SPI bus is initialised by sd_logger; this module adds
- * each IMU as a separate device with its own chip-select (CS pins per
- * pins.h) and `stmdev_ctx_t`. The vendored ST register-access driver
- * (firmware/components/lsm6dso32x_STdC/) provides the chip-level API.
+ * IDL1 carries three LSM6DSV320X: the onboard IMU0 on SPI2_HOST (this API,
+ * imu_driver.c; the bus is initialised by sd_logger) and the front/rear pods
+ * on I2C (imu_driver_i2c.h). Register-level work for both is in
+ * imu_chip_dsv320x.c, on top of the vendored ST driver
+ * (components/lsm6dsv320x_STdC, v5.4.0).
  *
  * Spec contracts: §3 (hardware), §4 (firmware), §5.4 / §5.5 (IMU
  * channel mask + IMU_SAMPLE record), §8 (per-IMU ODR / range / mode).
@@ -37,7 +38,24 @@ typedef enum {
     IDL0_IMU_ERROR,
 } idl0_imu_state_t;
 
-/* One drained sample, ready to be timestamped + framed by imu_task. */
+/* WHO_AM_I (0x0F) of the LSM6DSV320X fitted at every IDL1 IMU position. */
+#define IDL1_IMU_WHO_AM_I_DSV320X 0x73
+
+/* Outcome of an IMU's WHO_AM_I read at init, per IMU index. */
+typedef enum {
+    IDL0_IMU_PROBE_NOT_RUN = 0,  /* init never attempted for this index */
+    IDL0_IMU_PROBE_NO_RESPONSE,  /* bus error / address NACK on the read */
+    IDL0_IMU_PROBE_ANSWERED,     /* read completed; value in who_am_i */
+} idl0_imu_probe_status_t;
+
+typedef struct {
+    idl0_imu_probe_status_t status;
+    uint8_t who_am_i;  /* raw WHO_AM_I byte; valid only when ANSWERED */
+} idl0_imu_probe_t;
+
+/* One drained low-g/gyro sample, ready to be timestamped + framed by
+ * imu_task. High-g (pods, phase 3) is not a field here: it lands as
+ * separate CHANNEL_SAMPLE records on registry channels 24-29. */
 typedef struct {
     int16_t accel[3];  /* X, Y, Z — raw int16 LSB, no scaling */
     int16_t gyro[3];   /* X, Y, Z — raw int16 LSB */
@@ -64,18 +82,23 @@ bool idl0_imu_is_active(uint8_t imu_index);
 idl0_imu_state_t idl0_imu_per_state(uint8_t imu_index);
 
 /* Initialise one IMU (by index 0..IDL0_IMU_COUNT-1) on the shared SPI
- * host: add the device with its CS pin (per pins.h), verify WHO_AM_I
- * (0x6C), configure accel + gyro at the given ODR / range / mode,
- * enable FIFO continuous + BDR equal to ODR.
+ * host: add the device with its CS pin (per pins.h), then imu_chip_init():
+ * WHO_AM_I (0x73) before any register write, configure accel + gyro at the
+ * given ODR / range / mode, FIFO STREAM with BDR equal to ODR. On IDL1 only
+ * IMU0 has a chip-select; indices 1/2 (I2C pods) are refused.
  *
- * `sample_rate_hz`: one of 12 / 13 / 26 / 52 / 104 / 208 / 416 / 833 / 1666.
- * `accel_range_g`:  4, 8, 16, or 32.
- * `gyro_range_dps`: 125, 250, 500, 1000, or 2000.
- * `high_performance`: true → high-performance mode on both accel and gyro.
+ * `sample_rate_hz`: 15 / 30 / 60 / 120 / 240 / 480 / 960 / 1920 / 3840 / 7680.
+ * `accel_range_g`:  2, 4, 8, or 16.
+ * `gyro_range_dps`: 250, 500, 1000, 2000, or 4000.
+ * `high_performance`: true -> high-performance mode on accel and gyro;
+ *                     false -> the low-power modes the ODR allows.
+ * Off-list values are rejected at config-validation time, not mapped to the
+ * nearest supported value — a documented contract (decisions.md P2/P3);
+ * one that still reaches here fails init.
  *
- * Returns true on success (this IMU's per-instance state → OK).
+ * Returns true on success (this IMU's per-instance state -> OK).
  * On failure leaves the per-instance state at ABSENT (chip absent /
- * miswired / WHO_AM_I wrong) or ERROR (later read/write failure).
+ * miswired / WHO_AM_I wrong) or ERROR (a configuration write failed).
  * Independent of other IMUs — failure here does not affect siblings. */
 bool idl0_imu_init_one(spi_host_device_t spi_host,
                        uint8_t imu_index,
@@ -84,18 +107,13 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
                        uint16_t gyro_range_dps,
                        bool high_performance);
 
+/* WHO_AM_I probe result of the last idl0_imu_init_one() for this index.
+ * NOT_RUN for out-of-range or never-initialised indices. */
+idl0_imu_probe_t idl0_imu_probe_result(uint8_t imu_index);
+
 /* Per-IMU FIFO_STATUS unread-words count (0..512). Returns 0 if this
  * IMU is not active. */
 uint16_t idl0_imu_fifo_count(uint8_t imu_index);
-
-/* Pop one tagged FIFO word from the given IMU and append to its
- * pair-builder. If the word completes a (gyro, accel) pair, fills
- * `*out` and returns true; otherwise returns false. Pairs self-resync
- * on any tag-order inversion. Pure SPI I/O — no scaling.
- *
- * Superseded by idl0_imu_drain() for the polling path; kept for the
- * single-word use cases and tests. */
-bool idl0_imu_pop_sample(uint8_t imu_index, idl0_imu_sample_t *out);
 
 /* Burst-drain up to `max_pairs` (gyro, accel) pairs in a single DMA SPI
  * transaction (the FIFO streams from 0x78 with IF_INC auto-increment). The

@@ -1,12 +1,15 @@
-# idl0 — firmware
+# idl1 — firmware
 
-ESP32-C6 firmware for the IDL0 mountain-bike data logger. During a logging
-session it does raw sensor capture only — sensor bytes straight to the SD card,
-no processing. Everything else (BLE/WiFi control, OTA update, calibration, file
-transfer) runs outside the logging path.
+ESP32-C6 firmware for the IDL1 mountain-bike data logger — the board revision
+with M8 sensor pods on a shared I2C bus, a TLA2528 analog front end, and a
+switched 3V3 rail. During a logging session it does raw sensor capture only —
+sensor bytes straight to the SD card, no processing. Everything else (BLE/WiFi
+control, OTA update, calibration, file transfer) runs outside the logging path.
 
-Part of the three-repo IDL0 system: this firmware, the [idl-rs](https://github.com/saucyeng/idl-rs)
-processing engine, and the companion app.
+Forked from `idl0-firmware` (now the frozen IDL0 firmware). The wire format and
+BLE contract are still the IDL0 ones — the idl0 app talks to this firmware
+unchanged. Program docs (rulings, bring-up plan) live in `docs/program/`; the
+bench checklist is `docs/bringup.md`.
 
 ## Build & flash (ESP-IDF v6.0.1, target esp32c6)
 

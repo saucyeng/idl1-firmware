@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 
 #include "idl0_format.h"
+#include "pins.h"
 #include "writer_task.h"
 
 #define TAG "digital_task"
@@ -91,6 +92,26 @@ static void digital_task_fn(void *arg) {
     }
 }
 
+/* Is `pin` safe to hand to a config-defined marker input? The pin number
+ * comes from idl0_config.json (app-supplied), so it must never land on a
+ * GPIO the board already drives: above all IDL1_PIN_PWR_EN — reconfiguring
+ * it as an input switches off every peripheral mid-session (pins.h) — but
+ * also the bus, chip-select, UART and LED pins. */
+static bool marker_pin_allowed(int pin) {
+    if (pin < 0 || !GPIO_IS_VALID_GPIO(pin)) return false;
+    static const gpio_num_t board_owned[] = {
+        IDL1_PIN_PWR_EN, IDL1_PIN_BAT_SENSE, IDL1_PIN_LED_ONBOARD,
+        IDL1_PIN_SPI_SCK, IDL1_PIN_SPI_MOSI, IDL1_PIN_SPI_MISO,
+        IDL1_PIN_CS_SD, IDL1_PIN_CS_IMU0,
+        IDL1_PIN_GPS_TX, IDL1_PIN_GPS_RX,
+        IDL1_PIN_I2C_SDA, IDL1_PIN_I2C_SCL,
+    };
+    for (size_t i = 0; i < sizeof(board_owned) / sizeof(board_owned[0]); i++) {
+        if (pin == (int)board_owned[i]) return false;
+    }
+    return true;
+}
+
 void digital_task_start(const digital_channel_cfg_t *channels, size_t count) {
     digital_task_stop();
     if (channels == NULL || count == 0) return;
@@ -111,8 +132,14 @@ void digital_task_start(const digital_channel_cfg_t *channels, size_t count) {
     gpio_install_isr_service(0);
 
     for (size_t i = 0; i < count; i++) {
-        const digital_channel_cfg_t *ch = &s_channels[i];
+        digital_channel_cfg_t *ch = &s_channels[i];
         if (!ch->enabled) continue;
+        if (!marker_pin_allowed(ch->gpio_pin)) {
+            ESP_LOGW(TAG, "marker '%s' on GPIO %d refused: invalid or board-owned pin",
+                     ch->label, ch->gpio_pin);
+            ch->enabled = false;   /* also keeps digital_task_stop() off it */
+            continue;
+        }
         const gpio_config_t cfg = {
             .pin_bit_mask = 1ULL << ch->gpio_pin,
             .mode         = GPIO_MODE_INPUT,
