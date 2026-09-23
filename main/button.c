@@ -96,6 +96,9 @@ static void button_task(void *arg)
         if (raw != last_raw) {
             last_raw = raw;
             raw_since = now;
+            /* Raw edge trace, armed or not: shows exactly what the pin does
+             * (e.g. a normally-closed switch reads LOW at rest). */
+            ESP_LOGI(TAG, "GPIO%d raw -> %s", IDL1_PIN_USER_BTN, raw ? "LOW" : "HIGH");
         }
         const int64_t stable_ms = (now - raw_since) / 1000;
 
