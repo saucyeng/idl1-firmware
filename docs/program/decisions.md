@@ -377,3 +377,20 @@ The idl0 app's firmware catalog pulls `saucyeng/idl0-firmware` releases. An
 IDL0 image on IDL1 hardware drives GPIO2 (PWR_EN) as an IMU CS and GPIO23 (SCL)
 as SD CS. IDL1 firmware rejects any OTA image whose `esp_app_desc_t.project_name`
 is not `idl1_firmware`, checked on the first chunk before anything is written.
+
+### F6 — advertised name is `IDL1-XXXX`. FINAL (owner, 2026-10-05). Amends F3.
+The board advertises and names its WiFi AP `IDL1-XXXX`. The owner has committed
+to idl1-app; idl0-app compatibility is no longer a goal, so F3's "advertised
+name pattern unchanged" no longer holds. The rest of F3 stands: BLE UUIDs, the
+"IDL0" file magic, schema v3 and the status-line format are unchanged.
+
+### F7 — the record button pre-empts WiFi mode. FINAL (owner, 2026-10-14).
+A short press of USER_BTN while the AP is up stops WiFi mode and starts a
+recording, so getting back to recording never waits on the phone (target
+~1 s, 2–3 s acceptable). A `/download` in progress is cut off at its next
+8 KB chunk and the app resumes it later with `Range`; an `/ota` in progress
+is aborted, which leaves the running firmware in place because the new image
+only becomes the boot partition after a complete, verified upload. Only the
+button pre-empts: BLE `CMD_START_LOGGING` while the AP is up is still
+refused with `IDL0_ACK_MUTEX_REFUSED`. Spec: idl1-app `docs/IDL0_SPEC.md`
+§4.3 and §10.4.

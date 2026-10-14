@@ -16,6 +16,7 @@
 #include "session.h"
 #include "status.h"
 #include "tla2528.h"
+#include "wifi_server.h"
 
 static const char *TAG = "button";
 
@@ -29,9 +30,26 @@ static bool pressed_raw(void)
     return gpio_get_level(IDL1_PIN_USER_BTN) == 0;   /* active-low */
 }
 
+/* F7: a press while the logger is in WiFi mode drops WiFi and starts
+ * recording. The firmware refuses START_LOGGING while the AP is up (§10.4
+ * mutex), so WiFi goes first. This runs on the button task, not the NimBLE
+ * host task, so blocking in idl0_wifi_stop() is allowed here (T11 does not
+ * apply). Only the button pre-empts WiFi; BLE CMD_START_LOGGING is still
+ * refused with IDL0_ACK_MUTEX_REFUSED. */
+static void drop_wifi_for_recording(void)
+{
+    const int64_t t0 = esp_timer_get_time();
+    ESP_LOGW(TAG, "short press in WiFi mode -> dropping WiFi to record");
+    idl0_wifi_stop();
+    ESP_LOGI(TAG, "WiFi down in %lld ms", (long long)((esp_timer_get_time() - t0) / 1000));
+}
+
 static void toggle_recording(void)
 {
     const bool running = idl0_session_is_running();
+    if (!running && idl0_wifi_state() != IDL0_WIFI_OFF) {
+        drop_wifi_for_recording();
+    }
     const idl0_ble_command_t cmd = running ? IDL0_CMD_STOP_LOGGING
                                            : IDL0_CMD_START_LOGGING;
     ESP_LOGI(TAG, "short press -> %s", running ? "STOP recording" : "START recording");
@@ -158,7 +176,9 @@ void idl1_button_start(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
-    if (xTaskCreate(button_task, "button", 3072, NULL, 4, NULL) != pdPASS) {
+    /* 6 KB, was 3 KB: a press in WiFi mode now runs idl0_wifi_stop() on
+     * this task (httpd_stop, esp_wifi_stop, BLE resume, diag log to SD). */
+    if (xTaskCreate(button_task, "button", 6144, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "button task create failed");
     }
 }

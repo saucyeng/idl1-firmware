@@ -1,6 +1,6 @@
 /* WiFi AP mode + HTTP server for on-demand file transfer and config push.
  *
- * SSID derived from the MAC per §3.6 (idl0_device_name → "IDL0-XXXX").
+ * SSID derived from the MAC per §3.6 (idl0_device_name → "IDL1-XXXX").
  * Password is the §6 shared default until per-device passwords land
  * (§6 TODO #16). See §6.1 for endpoint contracts. WiFi is off by
  * default; CMD_WIFI_ON (§7.2) starts the AP + HTTP server, CMD_WIFI_OFF
@@ -29,7 +29,10 @@ const char *idl0_wifi_state_str(idl0_wifi_state_t state);
  * calls while already up return true without restarting the radio. */
 bool idl0_wifi_start(void);
 
-/* Stop the HTTP server and the AP. Idempotent. */
+/* Stop the HTTP server and the AP. Idempotent and safe to call from several
+ * tasks (serialised internally). A /download or /ota in progress is cut off
+ * at its next chunk (F7). Blocks while httpd_stop() joins the httpd worker,
+ * so never call it from the NimBLE host task (use idl0_wifi_stop_deferred). */
 bool idl0_wifi_stop(void);
 
 /* Defers idl0_wifi_stop() to a one-shot esp_timer (500 ms out) instead of

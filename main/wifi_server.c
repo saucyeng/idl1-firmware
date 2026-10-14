@@ -17,6 +17,7 @@
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_system.h"
 
@@ -49,6 +50,20 @@ static esp_netif_t      *s_ap_netif = NULL;
 static httpd_handle_t    s_httpd    = NULL;
 static bool              s_event_loop_inited = false;
 static bool              s_wifi_inited       = false;
+
+/* F7: set when WiFi mode is ending so a /download or /ota still streaming on
+ * the httpd worker returns at its next chunk (8 KB) instead of running to the
+ * end of the file. httpd_stop() joins that worker, so without this a button
+ * press mid-download would wait for the whole transfer. Cleared in
+ * idl0_wifi_start(). */
+static volatile bool     s_abort_transfers   = false;
+
+/* Serialises idl0_wifi_stop() across its callers: the esp_timer task
+ * (POST /wifi_off, idl0_wifi_stop_deferred), the failsafe task and, since
+ * F7, the button task. Without it two callers could both httpd_stop() the
+ * same handle. Created in idl0_wifi_start(); NULL means WiFi never started,
+ * so there is nothing to stop. */
+static SemaphoreHandle_t s_stop_lock         = NULL;
 
 /* Last HTTP request time, µs since boot — one input to the §10.4
  * no-activity failsafe. Touched by every endpoint handler; initialised
@@ -273,6 +288,13 @@ static esp_err_t download_get_handler(httpd_req_t *req)
     uint8_t buf[IDL0_DOWNLOAD_CHUNK];
     long remaining = end - start + 1;
     while (remaining > 0) {
+        if (s_abort_transfers) {
+            /* F7: WiFi mode is ending (record button). The client sees a
+             * truncated stream and resumes later with Range (§6.1). */
+            ESP_LOGW(TAG, "/download aborted: WiFi mode ending");
+            fclose(f);
+            return ESP_FAIL;
+        }
         size_t want = (remaining > (long)sizeof(buf)) ? sizeof(buf) : (size_t)remaining;
         size_t got = fread(buf, 1, want, f);
         if (got == 0) break;
@@ -475,6 +497,16 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     int consec_timeouts = 0;
     size_t received = 0;
     while (total == 0 || received < total) {
+        if (s_abort_transfers) {
+            /* F7: WiFi mode is ending (record button). Safe: the new image
+             * becomes the boot partition only after the whole upload is
+             * written and verified, so aborting leaves the running firmware
+             * in place. */
+            ESP_LOGW(TAG, "/ota aborted: WiFi mode ending");
+            free(buf);
+            idl0_ota_abort(s);  /* NULL-safe */
+            return ESP_FAIL;
+        }
         int n = httpd_req_recv(req, buf, IDL0_OTA_CHUNK);
         if (n == 0) break;                          /* EOF (chunked) */
         if (n == HTTPD_SOCK_ERR_TIMEOUT) {
@@ -851,6 +883,14 @@ bool idl0_wifi_start(void)
     if (s_state == IDL0_WIFI_ON) {
         return true;
     }
+    if (s_stop_lock == NULL) {
+        s_stop_lock = xSemaphoreCreateMutex();
+        if (s_stop_lock == NULL) {
+            ESP_LOGE(TAG, "stop lock create failed");
+            return false;
+        }
+    }
+    s_abort_transfers = false;
     if (!ensure_netif() || !ensure_event_loop()) {
         return false;
     }
@@ -872,7 +912,7 @@ bool idl0_wifi_start(void)
         s_wifi_inited = true;
     }
 
-    /* Build the AP config. SSID comes from idl0_device_name() — "IDL0-XXXX". */
+    /* Build the AP config. SSID comes from idl0_device_name() — "IDL1-XXXX". */
     const char *ssid = idl0_device_name();
     wifi_config_t wifi_cfg = {0};
     wifi_cfg.ap.ssid_len       = (uint8_t)strnlen(ssid, sizeof(wifi_cfg.ap.ssid));
@@ -956,9 +996,15 @@ bool idl0_wifi_start(void)
 bool idl0_wifi_stop(void)
 {
     ESP_LOGI(TAG, "wifi_stop enter; state=%s", idl0_wifi_state_str(s_state));
+    if (s_stop_lock == NULL) {
+        return true;  /* WiFi never started this boot */
+    }
+    xSemaphoreTake(s_stop_lock, portMAX_DELAY);
     if (s_state == IDL0_WIFI_OFF) {
+        xSemaphoreGive(s_stop_lock);
         return true;
     }
+    s_abort_transfers = true;
     /* Kill the failsafe poller — unless the failsafe itself is the
      * caller (it cleared the handle and self-deletes after we return). */
     if (s_failsafe_task != NULL &&
@@ -980,6 +1026,7 @@ bool idl0_wifi_stop(void)
      * path ended it (BLE CMD_WIFI_OFF pre-handoff, POST /wifi_off, or
      * the no-activity failsafe). No-op if BLE was never suspended. */
     idl0_ble_resume();
+    xSemaphoreGive(s_stop_lock);
     ESP_LOGI(TAG, "AP down");
     idl0_diag_log_event("wifi down");
     return true;
