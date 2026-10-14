@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 
+#include "battery.h"
 #include "ble_service.h"
 #include "device_id.h"
 #include "diag_log.h"
@@ -590,9 +591,17 @@ static esp_err_t ping_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(obj, "device", idl0_device_name());
     cJSON_AddStringToObject(obj, "fw", esp_app_get_description()->version);
     cJSON_AddNumberToObject(obj, "proto", IDL0_WIFI_PROTO_VERSION);
-    /* TODO(idl0): pull Battery from the battery driver (§10.1) once that
-     * subsystem lands — mirrors the same TODO in status.c. */
-    cJSON_AddNumberToObject(obj, "battery", 100);
+    /* Cell voltage, mV, as the status line's BatteryMv (§7.3), plus the
+     * deprecated "battery" percent that older apps require, estimated from
+     * it (0 when the read fails) instead of a hard-coded 100. */
+    int bat_raw = 0, bat_pin_mv = 0, bat_mv = 0;
+    const char *bat_why = NULL;
+    if (idl1_battery_read(&bat_raw, &bat_pin_mv, &bat_mv, &bat_why)) {
+        cJSON_AddNumberToObject(obj, "battery", idl1_battery_pct_estimate(bat_mv));
+        cJSON_AddNumberToObject(obj, "battery_mv", bat_mv);
+    } else {
+        cJSON_AddNumberToObject(obj, "battery", 0);
+    }
     cJSON_AddStringToObject(obj, "sd", idl0_sd_state_str(idl0_sd_state()));
     cJSON_AddStringToObject(obj, "mode", mode);
     cJSON_AddStringToObject(obj, "ble", idl0_ble_is_suspended() ? "off" : "on");

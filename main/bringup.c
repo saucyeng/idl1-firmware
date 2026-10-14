@@ -1,15 +1,13 @@
 /* See bringup.h. */
 
 #include "bringup.h"
+#include "battery.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
 #include "driver/gpio.h"
-#include "esp_adc/adc_cali.h"
-#include "esp_adc/adc_cali_scheme.h"
-#include "esp_adc/adc_oneshot.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,18 +22,12 @@
 
 static const char *TAG = "bringup";
 
-/* Battery divider (pins.h): R2 = 1M from BAT+, R3 = 2M to GND, so
- * Vbat = Vpin * 3 / 2. */
-#define BAT_DIV_NUM 3
-#define BAT_DIV_DEN 2
 /* Plausible single-cell Li-ion window at the battery, mV. Below
  * BAT_ABSENT_MV the divider sees essentially nothing (no cell, open
  * divider). */
 #define BAT_MIN_MV    3000
 #define BAT_MAX_MV    4350
 #define BAT_ABSENT_MV 500
-/* ADC samples averaged for the one battery reading, count. */
-#define BAT_SAMPLES   16
 
 /* USER_BTN poll period during the report window, ms. */
 #define BTN_POLL_MS   20
@@ -110,75 +102,6 @@ static row_t imu_row(uint8_t idx, bool on_i2c, char *detail, size_t dlen,
 }
 
 /* ---- Battery ------------------------------------------------------------- */
-
-/* One averaged, calibrated BAT_SENSE reading. Returns false (with *why set)
- * if the ADC or its calibration is unavailable. The unit is released again
- * afterwards: battery monitoring proper is phase 3. */
-static bool read_battery(int *pin_mv, int *raw_avg, const char **why)
-{
-    adc_unit_t unit;
-    adc_channel_t chan;
-    if (adc_oneshot_io_to_channel(IDL1_PIN_BAT_SENSE, &unit, &chan) != ESP_OK) {
-        *why = "GPIO is not an ADC pin";
-        return false;
-    }
-    adc_oneshot_unit_handle_t adc = NULL;
-    const adc_oneshot_unit_init_cfg_t ucfg = { .unit_id = unit };
-    if (adc_oneshot_new_unit(&ucfg, &adc) != ESP_OK) {
-        *why = "adc_oneshot_new_unit failed";
-        return false;
-    }
-    /* 12 dB attenuation: full scale ~3.1 V at the pin, above the 2.8 V a
-     * full cell puts there. */
-    const adc_oneshot_chan_cfg_t ccfg = {
-        .atten    = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    bool ok = false;
-    adc_cali_handle_t cali = NULL;
-    if (adc_oneshot_config_channel(adc, chan, &ccfg) != ESP_OK) {
-        *why = "adc_oneshot_config_channel failed";
-        goto out;
-    }
-    int32_t sum = 0;
-    for (int i = 0; i < BAT_SAMPLES; i++) {
-        int raw = 0;
-        if (adc_oneshot_read(adc, chan, &raw) != ESP_OK) {
-            *why = "adc_oneshot_read failed";
-            goto out;
-        }
-        sum += raw;
-    }
-    *raw_avg = (int)(sum / BAT_SAMPLES);
-
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    const adc_cali_curve_fitting_config_t kcfg = {
-        .unit_id  = unit,
-        .chan     = chan,
-        .atten    = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    if (adc_cali_create_scheme_curve_fitting(&kcfg, &cali) != ESP_OK) {
-        cali = NULL;
-        *why = "no ADC calibration (eFuse not burnt?)";
-        goto out;
-    }
-    if (adc_cali_raw_to_voltage(cali, *raw_avg, pin_mv) != ESP_OK) {
-        *why = "adc_cali_raw_to_voltage failed";
-        goto out;
-    }
-    ok = true;
-#else
-    *why = "no curve-fitting calibration on this target";
-#endif
-
-out:
-#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
-    if (cali != NULL) adc_cali_delete_scheme_curve_fitting(cali);
-#endif
-    adc_oneshot_del_unit(adc);
-    return ok;
-}
 
 /* ---- Report -------------------------------------------------------------- */
 
@@ -277,8 +200,7 @@ void idl1_bringup_report(void)
     /* Battery */
     int pin_mv = 0, raw = 0, vbat_mv = -1;
     const char *why = "";
-    if (read_battery(&pin_mv, &raw, &why)) {
-        vbat_mv = pin_mv * BAT_DIV_NUM / BAT_DIV_DEN;
+    if (idl1_battery_read(&raw, &pin_mv, &vbat_mv, &why)) {
         snprintf(d, sizeof(d), "pin %d mV (raw %d) x1.5 -> Vbat %d mV", pin_mv, raw, vbat_mv);
         if (vbat_mv < BAT_ABSENT_MV) {
             row("BATTERY", ROW_ABSENT, d);

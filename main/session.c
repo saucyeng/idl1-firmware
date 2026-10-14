@@ -48,6 +48,15 @@ static portMUX_TYPE s_running_mux = portMUX_INITIALIZER_UNLOCKED;
 
 bool idl0_session_is_running(void) { return s_running; }
 
+/* esp_timer_get_time() when the running session started, us. */
+static int64_t s_started_us = 0;
+
+uint32_t idl0_session_elapsed_s(void)
+{
+    if (!s_running) return 0;
+    return (uint32_t)((esp_timer_get_time() - s_started_us) / 1000000);
+}
+
 /* T03: idl0_writer_drain(500) can time out under a >500 ms SD stall — a
  * single call is not enough of a guarantee for the stop path, where a
  * missed drain silently drops trailing records or SESSION_END itself.
@@ -292,6 +301,7 @@ bool idl0_session_start(void)
      * assigned above in the registry loop. */
     digital_task_start(cfg.digital_channels, cfg.digital_channel_count);
 
+    s_started_us = esp_timer_get_time();
     s_running = true;
     s_first_fix_anchored = false;
     idl0_led_set(IDL0_LED_BLINK_FAST);

@@ -44,6 +44,12 @@ bool idl0_gps_init(void);
 idl0_gps_state_t idl0_gps_state(void);
 const char *idl0_gps_state_str(idl0_gps_state_t state);
 
+/* Latest GGA fix quality (raw NMEA field 6) and satellites used (field 7)
+ * for the §7.3 GPSFix/GPSSats lines. Both read 0 while no fresh GGA has
+ * arrived (searching, or older than the 3 s staleness window). Returns
+ * false when the GPS is ABSENT, so the lines are left out. */
+bool idl0_gps_live(uint8_t *fix_quality, uint8_t *satellites);
+
 /* Internal hook used by gps_task's lost-lock watchdog. Forces the
  * driver's state-machine to the given state. Also clears the cached GGA
  * staleness state (T25): a fix reacquired after a force-to-NOFIX must not

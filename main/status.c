@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
+#include "battery.h"
 #include "ble_service.h"
 #include "gps_driver.h"
 #include "hrm_task.h"
@@ -22,33 +23,65 @@ static const char *TAG = "status";
 
 static esp_timer_handle_t s_publish_timer = NULL;
 
-/* Sized for the §7.3 eleven-line worst case (six base + SD_Free + SD_Total
- * + OTA + HR + HR_Battery — the two SD capacity lines only appear together
- * with a non-ABSENT SD: token, per A7). Recomputed field-by-field with every
- * variable-length token at its max (WiFi 3 "OFF", Logging 7 "RUNNING", SD
- * 5 "ERROR", SD_Free/SD_Total 10 digits each — full uint32_t range, GPS 6
- * "ABSENT", IMU 7 "PARTIAL", Firmware 31 = esp_app_desc_t.version[32] minus
- * the NUL, OTA fixed 19 "OTA: PENDING_VERIFY", HR 18 "HR: NO_CONTACT 255",
- * HR_Battery 16 "HR_Battery: 255%"): 220 bytes + NUL = 221. 256 leaves 35
- * bytes of headroom and matches the BLE preferred MTU (§6 —
- * CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256). Keep in lockstep with s_status
- * in ble_service.c. */
-#define IDL0_STATUS_BUF_BYTES 256
+/* Sized for the full §7.3 line set with every variable-length token at its
+ * max: WiFi, Logging, LoggingElapsed (10 digits), BatteryRaw + BatteryMv,
+ * SD, SDFreeMiB (10 digits), GPS, GPSFix, GPSSats, IMU, IMU0-IMU2, Firmware
+ * (31), OTA, HR, HR_Battery: about 330 bytes. 384 leaves headroom; the
+ * preferred ATT MTU is 512 (sdkconfig.defaults) so one notification carries
+ * it. Keep in lockstep with s_status in ble_service.c. */
+#define IDL0_STATUS_BUF_BYTES 384
+
+/* §7.3 per-IMU token for IMU `index`: OFF not configured, ABSENT no answer
+ * on the bus, OK delivering data, ERROR answered but not delivering. */
+static const char *imu_token(uint8_t index)
+{
+    const idl0_imu_probe_t probe = idl0_imu_task_probe(index);
+    switch (probe.status) {
+        case IDL0_IMU_PROBE_NOT_RUN:     return "OFF";
+        case IDL0_IMU_PROBE_NO_RESPONSE: return "ABSENT";
+        case IDL0_IMU_PROBE_ANSWERED:
+        default:
+            return idl0_imu_task_is_active(index) ? "OK" : "ERROR";
+    }
+}
 
 void idl0_status_publish(void)
 {
     char status[IDL0_STATUS_BUF_BYTES];
     const idl0_sd_state_t sd_state = idl0_sd_state();
 
-    /* TODO(idl0): pull Battery from the battery driver (§10.1) once
-     * that subsystem lands. */
     int n = snprintf(status, sizeof(status),
-             "WiFi: %s\nLogging: %s\nBattery: 100%%\nSD: %s",
+             "WiFi: %s\nLogging: %s",
              idl0_wifi_state_str(idl0_wifi_state()),
-             idl0_session_is_running() ? "RUNNING" : "STOPPED",
-             idl0_sd_state_str(sd_state));
+             idl0_session_is_running() ? "RUNNING" : "STOPPED");
     if (n < 0) return;
     size_t cursor = (size_t)n;
+
+    if (cursor < sizeof(status) && idl0_session_is_running()) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nLoggingElapsed: %lu", (unsigned long)idl0_session_elapsed_s());
+        if (add > 0) cursor += (size_t)add;
+    }
+
+    /* Battery (§7.3): BatteryRaw is the averaged ADC count, BatteryMv the
+     * calibrated cell voltage after the divider (mV), which the app
+     * prefers. "Battery: N%" is deprecated and kept one revision for older
+     * apps, now estimated from the voltage instead of a hard-coded 100%.
+     * All three are left out when the read fails. */
+    int bat_raw = 0, bat_pin_mv = 0, bat_mv = 0;
+    const char *bat_why = NULL;
+    if (cursor < sizeof(status) && idl1_battery_read(&bat_raw, &bat_pin_mv, &bat_mv, &bat_why)) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nBattery: %d%%\nBatteryRaw: %d\nBatteryMv: %d",
+                           idl1_battery_pct_estimate(bat_mv), bat_raw, bat_mv);
+        if (add > 0) cursor += (size_t)add;
+    }
+
+    if (cursor < sizeof(status)) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nSD: %s", idl0_sd_state_str(sd_state));
+        if (add > 0) cursor += (size_t)add;
+    }
 
     /* A7 (decisions, narrowed scope) / R2: card capacity + usage, directly
      * after SD: in the emit order. Omitted entirely when ABSENT (no card to
@@ -57,11 +90,12 @@ void idl0_status_publish(void)
      * Values come from sd_logger's cache (idl0_sd_free_mb/idl0_sd_total_mb)
      * — never a live FATFS query here, since this runs at 1 Hz whether or
      * not a session is active (see sd_logger.c for the refresh points). */
-    if (cursor < sizeof(status) && sd_state != IDL0_SD_ABSENT) {
+    /* §7.3 SDFreeMiB, present for SD OK|FULL only. sd_logger's "MB" are
+     * MiB (bytes / 1024 / 1024). Replaces SD_Free/SD_Total, which matched
+     * no app parser. */
+    if (cursor < sizeof(status) && (sd_state == IDL0_SD_OK || sd_state == IDL0_SD_FULL)) {
         int add = snprintf(status + cursor, sizeof(status) - cursor,
-                           "\nSD_Free: %u MB\nSD_Total: %u MB",
-                           (unsigned)idl0_sd_free_mb(),
-                           (unsigned)idl0_sd_total_mb());
+                           "\nSDFreeMiB: %u", (unsigned)idl0_sd_free_mb());
         if (add > 0) cursor += (size_t)add;
     }
 
@@ -71,9 +105,20 @@ void idl0_status_publish(void)
      * while both I²C IMUs are down. */
     if (cursor < sizeof(status)) {
         int add = snprintf(status + cursor, sizeof(status) - cursor,
-                           "\nGPS: %s\nIMU: %s\nFirmware: %s",
-                           idl0_gps_state_str(idl0_gps_state()),
+                           "\nGPS: %s", idl0_gps_state_str(idl0_gps_state()));
+        if (add > 0) cursor += (size_t)add;
+    }
+    uint8_t gps_fix = 0, gps_sats = 0;
+    if (cursor < sizeof(status) && idl0_gps_live(&gps_fix, &gps_sats)) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nGPSFix: %u\nGPSSats: %u", (unsigned)gps_fix, (unsigned)gps_sats);
+        if (add > 0) cursor += (size_t)add;
+    }
+    if (cursor < sizeof(status)) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nIMU: %s\nIMU0: %s\nIMU1: %s\nIMU2: %s\nFirmware: %s",
                            idl0_imu_state_str(idl0_imu_task_state()),
+                           imu_token(0), imu_token(1), imu_token(2),
                            esp_app_get_description()->version);
         if (add > 0) cursor += (size_t)add;
     }

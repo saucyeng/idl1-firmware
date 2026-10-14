@@ -402,3 +402,17 @@ refused with `IDL0_ACK_MUTEX_REFUSED`. Spec: idl1-app `docs/IDL0_SPEC.md`
 so the app can check for new sessions without entering WiFi mode. Same mutex
 as the config commands (refused while logging). Spec: idl1-app
 `docs/IDL0_SPEC.md` §7.2.
+
+### F9 — status line carries the §7.3 additive fields. FINAL (lead, 2026-10-14).
+Owner reported the app showing battery 100% with no cell fitted and no SD
+free space. Causes: `Battery: 100%` was hard-coded, and SD free space went
+out as `SD_Free: N MB`, which no app parser reads. The status line now
+emits `LoggingElapsed`, `BatteryRaw`, `BatteryMv` (new: calibrated cell
+voltage, mV), `SDFreeMiB`, `GPSFix`, `GPSSats`, and `IMU0`–`IMU2` per spec
+§7.3; `Battery: N%` and `/ping` `battery` stay one revision for older apps,
+estimated from the voltage. `GPSHDOP` is not emitted (GGA HDOP isn't kept).
+Battery sense moved from bringup.c into `battery.c` (ADC unit created once,
+mutex-guarded). The status buffer grew to 384 bytes and the preferred ATT
+MTU to 512 so one notification carries every line. No charger status pin
+exists on this board, so a charger holding the node at 4.2 V with no cell
+reads as full: hardware fix (charger STAT to a GPIO) for the next spin.

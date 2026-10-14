@@ -273,6 +273,18 @@ bool idl0_gps_feed_line(const char *line, idl0_gps_fix_t *out_fix)
     return false;  /* unhandled sentence — silently ignored */
 }
 
+bool idl0_gps_live(uint8_t *fix_quality, uint8_t *satellites)
+{
+    if (s_state == IDL0_GPS_ABSENT) return false;
+    /* Single-byte fields written by the GPS task; a torn read is not
+     * possible, and a one-second-stale value is fine for a status line. */
+    const bool fresh = s_gga_seen &&
+        (esp_timer_get_time() - s_last_gga_us) <= IDL0_GPS_GGA_STALE_US;
+    *fix_quality = fresh ? s_pending.fix_quality : 0;
+    *satellites  = fresh ? s_pending.satellites  : 0;
+    return true;
+}
+
 #define IDL0_GPS_UART       UART_NUM_1
 #define IDL0_GPS_BAUD       9600
 #define IDL0_GPS_RX_BUF     2048

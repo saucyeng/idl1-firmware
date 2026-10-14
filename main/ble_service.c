@@ -80,12 +80,10 @@ static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t s_status_val_handle;
 
 /* Latest status string (§7.3). Served on READ and sent on NOTIFY.
- * Sized for the eleven §7.3 lines worst case (six base + optional SD_Free,
- * SD_Total, OTA, HR, HR_Battery) — recomputed to 220 bytes + NUL; see the
- * IDL0_STATUS_BUF_BYTES comment in status.c for the field-by-field count.
- * The publisher in status.c builds into a matching 256 B buffer — keep
- * both in lockstep. */
-static char s_status[256] = "WiFi: OFF\nLogging: STOPPED\nBattery: 100%";
+ * Sized for the full §7.3 line set; see the IDL0_STATUS_BUF_BYTES comment
+ * in status.c for the count. The publisher builds into a matching 384 B
+ * buffer — keep both in lockstep. */
+static char s_status[384] = "WiFi: OFF\nLogging: STOPPED";
 
 /* T12: guards s_status against a torn read. status_access_cb runs on the
  * NimBLE host task; idl0_ble_publish_status runs from the 1 Hz esp_timer

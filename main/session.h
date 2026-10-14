@@ -12,6 +12,9 @@
 bool idl0_session_start(void);
 bool idl0_session_stop(void);
 bool idl0_session_is_running(void);
+/* Whole seconds since the running session started (esp_timer, device-
+ * monotonic), for the §7.3 LoggingElapsed line. 0 when not running. */
+uint32_t idl0_session_elapsed_s(void);
 
 /* Called from idl0_ble_init callback. */
 uint8_t idl0_session_on_ble_command(idl0_ble_command_t cmd);

@@ -28,6 +28,7 @@ idf_component_register(
          "mode_state.c"
          "diag_log.c"
          "bringup.c"
+         "battery.c"
          "button.c"
          "session_files.c"
          "board_leds.c"

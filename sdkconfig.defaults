@@ -29,9 +29,10 @@ CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
 
-# Preferred ATT MTU 256 so the multi-line status string (§7.3) fits in a
-# single notification once the app negotiates MTU up from the 23-byte default.
-CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
+# Preferred ATT MTU 512 so the multi-line status string (§7.3, ~330 bytes
+# with every line present) fits in a single notification once the app
+# negotiates MTU up from the 23-byte default (Android asks for 517).
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=512
 
 # NimBLE host task stack: 8 KB (default 4 KB).
 # BLE control-write callbacks run inline in the NimBLE host task; on
