@@ -1,0 +1,61 @@
+name: firmware-ci
+
+# Builds the firmware on every push to main (and by hand), so nothing has to
+# compile on the dev machine. The image is left on the run as an artifact,
+# `idl1-firmware-<short sha>`, holding `idl1-firmware-<short sha>.bin` plus a
+# `sha256sum` sidecar. Nothing is published: releases (and so the app's OTA
+# catalog) still come only from version tags, via firmware-release.yml.
+#
+# Without version.txt the image reports a git-describe version (README,
+# CLAUDE.md §3), which tells a dev build apart from a release on the device.
+#
+# Flash it with `idf.py -p <port> flash` from a checkout of the same commit,
+# or load the .bin in the app's firmware screen as a local file.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: firmware-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe needs the tags
+          submodules: recursive
+
+      - name: Build firmware (ESP-IDF)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v6.0.1
+          target: esp32c6
+          path: '.'
+
+      - name: Stage image
+        id: stage
+        run: |
+          # build/ is root-owned (the action builds in Docker): stage into a
+          # runner-owned dist/, same as firmware-release.yml.
+          APP_BIN=build/idl1_firmware.bin   # fixed by project(idl1_firmware) in CMakeLists.txt
+          test -f "$APP_BIN" || { echo "::error::app image not found at $APP_BIN"; exit 1; }
+          name="idl1-firmware-${GITHUB_SHA:0:7}"
+          mkdir -p dist
+          cp "$APP_BIN" "dist/${name}.bin"
+          (cd dist && sha256sum "${name}.bin" > "${name}.bin.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.name }}
+          path: dist/*
+          if-no-files-found: error

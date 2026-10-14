@@ -5,18 +5,17 @@ name: firmware-release
 # esp_app_desc_t.version, which the app reads over /ping and the §7.3 status line
 # to offer OTA updates.
 #
-# Release asset contract: exactly one `.bin` asset per release —
-# `idl0-firmware-v<ver>.bin` — plus its checksum sidecar
-# `idl0-firmware-v<ver>.bin.sha256`, in `sha256sum` output format
-# (`<hex>  <filename>`). The app (app/lib/transport/firmware_catalog.dart in
-# idl0-app) matches release assets by `.bin`/`.sha256` suffix and takes the
-# LAST `.bin` asset it sees, so publishing a second `.bin` asset on a release
-# is hazardous — don't add one (this bit CI once: `build/` also contains
-# `ota_data_initial.bin`, an 8-byte otadata seed, which a naive `find`/`head`
-# could publish instead of the app image). The app also parses the sha256
-# file's first whitespace-delimited token as the expected hash, which is why
-# `sha256sum` format (not a bare hex file) is required — it doubles as
-# something a human can verify with `sha256sum -c`.
+# Release asset contract (idl1-app ruling R198, read by idl1-app's
+# rust/transport/src/firmware_catalog.rs): exactly one `.bin` asset per release,
+# `idl1-firmware-<ver>.bin` (no leading `v`), plus its checksum sidecar
+# `idl1-firmware-<ver>.bin.sha256` in `sha256sum` output format
+# (`<hex>  <filename>`). The app installs only a release carrying that exact
+# `.bin` name; the sidecar is what arms auto-confirm. Never publish a second
+# `.bin` (`build/` also contains `ota_data_initial.bin`, an 8-byte otadata
+# seed, which a naive `find`/`head` could publish instead of the app image).
+#
+# The app's catalog reads GitHub's public releases API with no token, so it
+# sees these releases only while this repo is public.
 
 on:
   push:
@@ -61,10 +60,10 @@ jobs:
           test -f "$APP_BIN" || { echo "::error::app image not found at $APP_BIN"; exit 1; }
           V="${VERSION}"
           mkdir -p dist
-          cp "$APP_BIN" "dist/idl0-firmware-v${V}.bin"
-          (cd dist && sha256sum "idl0-firmware-v${V}.bin" > "idl0-firmware-v${V}.bin.sha256")
-          echo "bin=dist/idl0-firmware-v${V}.bin" >> "$GITHUB_OUTPUT"
-          echo "sha=dist/idl0-firmware-v${V}.bin.sha256" >> "$GITHUB_OUTPUT"
+          cp "$APP_BIN" "dist/idl1-firmware-${V}.bin"
+          (cd dist && sha256sum "idl1-firmware-${V}.bin" > "idl1-firmware-${V}.bin.sha256")
+          echo "bin=dist/idl1-firmware-${V}.bin" >> "$GITHUB_OUTPUT"
+          echo "sha=dist/idl1-firmware-${V}.bin.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
