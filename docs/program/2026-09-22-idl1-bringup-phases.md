@@ -5,7 +5,7 @@ Written 2026-09-22, the day IDL1 boards arrived. Authority: `decisions.md`
 the owner's three phases and records the corrections made while reviewing it.
 Task numbers `PT<n>` refer to `pod-firmware-plan.md`.
 
-Repo: `saucyeng/idl1-firmware` (private), forked from `idl0-firmware@f4f26c6`.
+Repo: `saucyeng/idl1-firmware`, forked from `idl0-firmware@f4f26c6`.
 Bring-up happens on a different machine from the one that writes the code, so
 the repo carries its own copy of the program docs under `docs/program/`.
 

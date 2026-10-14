@@ -1,7 +1,7 @@
 # Contributor License Agreement
 
-By submitting a contribution to any saucyeng/IDL0 repository (`idl0-firmware`,
-`idl-rs`, `idl0-app`), you agree that:
+By submitting a contribution to any saucyeng IDL repository (`idl1-firmware`,
+`idl1-app`, `idl-rs`, `idl0-firmware`, `idl0-app`), you agree that:
 
 1. You license your contribution to the project owner under the repository's
    license (AGPL-3.0-or-later, or GPL-3.0-or-later for firmware), **and**

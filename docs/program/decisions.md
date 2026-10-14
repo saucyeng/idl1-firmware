@@ -345,7 +345,7 @@ All are runtime-configurable defaults per the standing rule.
 ## Bring-up week — rulings of 2026-09-22 (boards arrived)
 
 ### F1 — repo. FINAL.
-`saucyeng/idl1-firmware`, **private**, forked with full history from
+`saucyeng/idl1-firmware` (private until public release), forked with full history from
 `idl0-firmware` main at `f4f26c6`. `idl0-firmware` becomes the frozen IDL0
 firmware (bug fixes only).
 

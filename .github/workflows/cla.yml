@@ -29,7 +29,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_ASSISTANT_PAT }}
         with:
-          path-to-document: https://github.com/saucyeng/idl0-firmware/blob/main/CLA.md
+          path-to-document: https://github.com/saucyeng/idl1-firmware/blob/main/CLA.md
           path-to-signatures: signatures/cla.json
           branch: cla-signatures
           allowlist: isaacallen73,bot*,dependabot[bot]
