@@ -93,6 +93,7 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
         case IDL0_CMD_CONFIG_BEGIN:
         case IDL0_CMD_CONFIG_COMMIT:
         case IDL0_CMD_CONFIG_READ_BEGIN:
+        case IDL0_CMD_FILES_READ_BEGIN:
             /* Config push/read handshakes are handled entirely in the BLE
              * layer (it owns the FF05/FF06 buffers) and never routed here.
              * Defensive: if one ever reaches the dispatcher, refuse cleanly. */
