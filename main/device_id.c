@@ -8,8 +8,8 @@
 
 static const char *TAG = "devid";
 
-/* "IDL0-" + 4 hex chars + NUL = 10 bytes. */
-static char s_device_name[10] = "IDL0-0000";
+/* "IDL1-" + 4 hex chars + NUL = 10 bytes. */
+static char s_device_name[10] = "IDL1-0000";
 static uint8_t s_device_id[6] = {0};
 
 void idl0_device_id_init(void)
@@ -19,10 +19,10 @@ void idl0_device_id_init(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_efuse_mac_get_default failed (%s); using fallback name",
                  esp_err_to_name(err));
-        return;  /* keep the "IDL0-0000" default */
+        return;  /* keep the "IDL1-0000" default */
     }
 
-    snprintf(s_device_name, sizeof(s_device_name), "IDL0-%02X%02X", mac[4], mac[5]);
+    snprintf(s_device_name, sizeof(s_device_name), "IDL1-%02X%02X", mac[4], mac[5]);
     memcpy(s_device_id, mac, sizeof(s_device_id));
     ESP_LOGI(TAG, "device name: %s (MAC %02X:%02X:%02X:%02X:%02X:%02X)",
              s_device_name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);

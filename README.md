@@ -7,8 +7,8 @@ sensor bytes straight to the SD card, no processing. Everything else (BLE/WiFi
 control, OTA update, calibration, file transfer) runs outside the logging path.
 
 Forked from `idl0-firmware` (now the frozen IDL0 firmware). The wire format and
-BLE contract are still the IDL0 ones — the idl0 app talks to this firmware
-unchanged. Program docs (rulings, bring-up plan) live in `docs/program/`; the
+BLE contract are still the IDL0 ones, but the board advertises as `IDL1-XXXX`
+and is driven from idl1-app (decisions.md F6). Program docs (rulings, bring-up plan) live in `docs/program/`; the
 bench checklist is `docs/bringup.md`.
 
 ## Build & flash (ESP-IDF v6.0.1, target esp32c6)
