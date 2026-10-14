@@ -38,6 +38,7 @@
 #include "ota.h"
 #include "ota_guard.h"
 #include "sd_logger.h"
+#include "session_files.h"
 
 static const char *TAG = "wifi";
 
@@ -86,8 +87,6 @@ const char *idl0_wifi_state_str(idl0_wifi_state_t state)
     }
 }
 
-#define IDL0_SESSIONS_DIR IDL0_SD_MOUNT_POINT "/sessions"
-
 /* Reads ?file=<name> from the query string into `out` (NUL-terminated).
  * Returns true on success. Rejects empty names and names containing
  * '/' or '\' (path-traversal guard — only direct children of
@@ -107,34 +106,6 @@ static bool read_file_param(httpd_req_t *req, char *out, size_t out_len)
     for (const char *p = out; *p != '\0'; p++) {
         if (*p == '/' || *p == '\\') return false;
     }
-    return true;
-}
-
-/* Reads the 16-byte session UUID from the v3 header of [path] and renders it
- * as 32 lowercase hex chars into [out] (33 bytes incl. NUL), matching the
- * app's BinaryParser rendering. The UUID lives at file offset 5 — after the
- * 4-byte "IDL0" magic and 1-byte schema version (§5.1).
- *
- * Returns true on success. On a short read or magic mismatch returns false
- * and the caller omits "session_id"; the app then treats that file as
- * identity-unknown rather than failing. */
-static bool read_session_id_hex(const char *path, char out[33])
-{
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) return false;
-    uint8_t prefix[21];  /* 4 magic + 1 schema + 16 uuid */
-    size_t got = fread(prefix, 1, sizeof(prefix), f);
-    fclose(f);
-    if (got < sizeof(prefix)) return false;
-    if (memcmp(prefix, "IDL0", 4) != 0) return false;
-
-    static const char hex[] = "0123456789abcdef";
-    for (int i = 0; i < 16; i++) {
-        uint8_t b = prefix[5 + i];
-        out[i * 2]     = hex[b >> 4];
-        out[i * 2 + 1] = hex[b & 0x0F];
-    }
-    out[32] = '\0';
     return true;
 }
 
@@ -172,7 +143,7 @@ static esp_err_t files_get_handler(httpd_req_t *req)
              * without downloading them (§6.1). Omitted if the header can't
              * be read; the app then shows the file as identity-unknown. */
             char sid[33];
-            if (read_session_id_hex(path, sid)) {
+            if (idl0_read_session_id_hex(path, sid)) {
                 cJSON_AddStringToObject(obj, "session_id", sid);
             }
 

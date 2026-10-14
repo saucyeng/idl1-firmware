@@ -394,3 +394,11 @@ only becomes the boot partition after a complete, verified upload. Only the
 button pre-empts: BLE `CMD_START_LOGGING` while the AP is up is still
 refused with `IDL0_ACK_MUTEX_REFUSED`. Spec: idl1-app `docs/IDL0_SPEC.md`
 §4.3 and §10.4.
+
+### F8 — recent-session list over BLE. FINAL (owner, 2026-10-14).
+`CMD_FILES_READ_BEGIN` (0x0A) snapshots the 10 newest files in `/sessions/`
+(names in descending byte order) as compact JSON
+`{"total":N,"files":[{name,size,session_id}]}` into the FF06 read-back buffer,
+so the app can check for new sessions without entering WiFi mode. Same mutex
+as the config commands (refused while logging). Spec: idl1-app
+`docs/IDL0_SPEC.md` §7.2.

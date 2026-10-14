@@ -28,6 +28,11 @@ typedef enum {
      * each read serving the next chunk until an empty read signals EOF. Used
      * to round-trip / verify a push. Handled in the BLE layer. */
     IDL0_CMD_CONFIG_READ_BEGIN = 0x09,
+    /* BLE recent-session list (§7.2, added 2026-10-14). Snapshots the
+     * IDL0_FILES_READ_MAX newest session files as compact JSON into the same
+     * FF06 read-back buffer, so the app can spot new sessions without WiFi.
+     * Handled in the BLE layer. */
+    IDL0_CMD_FILES_READ_BEGIN  = 0x0A,
 } idl0_ble_command_t;
 
 /* Returns the ATT result code that the GATT write response will carry:

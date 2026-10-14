@@ -29,6 +29,7 @@ idf_component_register(
          "diag_log.c"
          "bringup.c"
          "button.c"
+         "session_files.c"
          "board_leds.c"
     INCLUDE_DIRS "."
     REQUIRES

@@ -30,6 +30,7 @@
 #include "diag_log.h"
 #include "idl0_config.h"
 #include "session.h"
+#include "session_files.h"
 
 static const char *TAG = "ble";
 
@@ -261,6 +262,25 @@ static uint8_t config_read_begin(void)
     return IDL0_ACK_OK;
 }
 
+/* CMD_FILES_READ_BEGIN (0x0A, §7.2): snapshot the newest session files as
+ * JSON into the FF06 read-back buffer (shared with CONFIG_READ_BEGIN;
+ * whichever came last owns it) and reset the cursor. Returns the ATT ack for
+ * the FF03 write response. */
+static uint8_t files_read_begin(void)
+{
+    config_tx_reset();
+    size_t len = 0;
+    char *json = idl0_session_files_newest_json(IDL0_FILES_READ_MAX, &len);
+    if (json == NULL) {
+        return IDL0_ACK_BUSY;  /* allocation failed: app may retry */
+    }
+    s_cfg_tx_buf = json;  /* cJSON allocates with malloc: config_tx_reset frees it */
+    s_cfg_tx_len = len;
+    s_cfg_tx_pos = 0;
+    idl0_diag_log_event("ble files read begin");
+    return IDL0_ACK_OK;
+}
+
 /* Config-TX characteristic (FF06) — read-only. Each read serves the next
  * IDL0_BLE_CONFIG_TX_CHUNK bytes of the snapshot and advances the cursor; an
  * empty read means EOF (cursor at end) or no read-back open. The app reads
@@ -310,7 +330,7 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    if (cmd < IDL0_CMD_WIFI_ON || cmd > IDL0_CMD_CONFIG_READ_BEGIN) {
+    if (cmd < IDL0_CMD_WIFI_ON || cmd > IDL0_CMD_FILES_READ_BEGIN) {
         ESP_LOGW(TAG, "unknown control command 0x%02X", cmd);
         return BLE_ATT_ERR_INVALID_PDU;
     }
@@ -321,7 +341,8 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
      * FF05 / FF06 buffers), not routed to the mode-command dispatcher. */
     bool is_config_cmd = (cmd == IDL0_CMD_CONFIG_BEGIN ||
                           cmd == IDL0_CMD_CONFIG_COMMIT ||
-                          cmd == IDL0_CMD_CONFIG_READ_BEGIN);
+                          cmd == IDL0_CMD_CONFIG_READ_BEGIN ||
+                          cmd == IDL0_CMD_FILES_READ_BEGIN);  /* reads the SD card too */
     if (is_config_cmd && idl0_session_is_running()) {
         /* T01 / owner ruling (decisions A1): config commands hold the
          * WiFi/logging-style mutex (\302\2477.2) and are refused with
@@ -342,6 +363,9 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
     if (cmd == IDL0_CMD_CONFIG_READ_BEGIN) {
         return config_read_begin();
+    }
+    if (cmd == IDL0_CMD_FILES_READ_BEGIN) {
+        return files_read_begin();
     }
 
     uint8_t ack = IDL0_ACK_OK;
