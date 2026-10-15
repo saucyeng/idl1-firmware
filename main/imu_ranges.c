@@ -27,7 +27,42 @@ static const struct { int32_t dps; float mdps_per_lsb; } GYRO[] = {
     { 4000, 140.0f  },
 };
 
+/* High-g ODR ladder, Hz (CTRL1_XL_HG ODR codes 011..111). */
+static const int32_t HG_ODR_SET[] = { 480, 960, 1920, 3840, 7680 };
+
+/* High-g full-scale (g) and typical sensitivity (mg/LSB), datasheet high-g
+ * mechanical characteristics (F11: re-check against the PDF on bring-up;
+ * ±320 g is not 320/32768). */
+static const struct { int32_t g; float mg_per_lsb; } HG_ACCEL[] = {
+    {  32,  0.976f },
+    {  64,  1.952f },
+    { 128,  3.904f },
+    { 256,  7.808f },
+    { 320, 10.417f },
+};
+
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
+
+bool idl1_imu_hg_odr_valid(int32_t hz)
+{
+    for (size_t i = 0; i < COUNT(HG_ODR_SET); i++) {
+        if (HG_ODR_SET[i] == hz) return true;
+    }
+    return false;
+}
+
+bool idl1_imu_hg_range_valid(int32_t g)
+{
+    return idl1_imu_hg_g_per_lsb(g) > 0.0f;
+}
+
+float idl1_imu_hg_g_per_lsb(int32_t g)
+{
+    for (size_t i = 0; i < COUNT(HG_ACCEL); i++) {
+        if (HG_ACCEL[i].g == g) return HG_ACCEL[i].mg_per_lsb / 1000.0f;
+    }
+    return 0.0f;
+}
 
 bool idl1_imu_odr_valid(int32_t hz)
 {

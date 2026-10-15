@@ -60,6 +60,13 @@ typedef struct {
      * full struct grows as bring-up progresses. */
     bool imu_enabled[3];
 
+    /* High-g accelerometer (F11; spec §8 imu.imuN.hg_enabled, imu.hg_range_g,
+     * imu.hg_sample_rate_hz). Per-IMU switch, off by default; the range and
+     * rate are shared by every IMU. Recorded only on an enabled IMU. */
+    bool     hg_enabled[3];
+    uint16_t hg_sample_rate_hz;   /* {480, 960, 1920, 3840, 7680}, default 960 */
+    uint16_t hg_range_g;          /* {32, 64, 128, 256, 320}, default 64 */
+
     /* IMU channel mask (§5.4): bits 0-5 IMU0 accel XYZ / gyro XYZ,
      * 6-11 IMU1, 12-17 IMU2. Derived from the per-axis `channels`
      * object in idl0_config.json. */

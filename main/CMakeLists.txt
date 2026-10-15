@@ -8,6 +8,7 @@ idf_component_register(
          "ble_service.c"
          "sd_logger.c"
          "idl0_format.c"
+         "idl1_format.c"
          "idl0_config.c"
          "session.c"
          "writer_task.c"

@@ -20,6 +20,23 @@
 #define IDL1_IMU_DEFAULT_ACCEL_RANGE_G  16
 #define IDL1_IMU_DEFAULT_GYRO_RANGE_DPS 2000
 
+/* High-g defaults (decisions.md Q8): imu.hg_sample_rate_hz 960 Hz,
+ * imu.hg_range_g ±64 g. Runtime config values like the three above. */
+#define IDL1_IMU_DEFAULT_HG_ODR_HZ    960
+#define IDL1_IMU_DEFAULT_HG_RANGE_G    64
+
+/* True if `hz` is a valid imu.hg_sample_rate_hz, Hz: {480, 960, 1920, 3840,
+ * 7680}. High-g has no rate below 480 and no FIFO decimation (P1). */
+bool idl1_imu_hg_odr_valid(int32_t hz);
+
+/* True if `g` is a valid imu.hg_range_g, g: {32, 64, 128, 256, 320}. */
+bool idl1_imu_hg_range_valid(int32_t g);
+
+/* High-g accelerometer sensitivity at full-scale `g`, in g per LSB
+ * (0.976 / 1.952 / 3.904 / 7.808 / 10.417 mg/LSB, the datasheet's typical
+ * values; F11). 0.0f for an off-list range. */
+float idl1_imu_hg_g_per_lsb(int32_t g);
+
 /* True if `hz` is a valid imu.sample_rate_hz, Hz:
  * {15, 30, 60, 120, 240, 480, 960, 1920, 3840, 7680}. */
 bool idl1_imu_odr_valid(int32_t hz);

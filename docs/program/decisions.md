@@ -430,3 +430,30 @@ app's Send applies. The CRC is taken from the new bytes. P2/P3 still hold:
 the value in use is the default or seed, never a nearest neighbour.
 Idempotent: a healed file rejects nothing, so the next load writes nothing.
 The `hg_*` fields are not parsed yet, so not healed (bring-up phase 3).
+
+### F11 — high-g config and value sets. FINAL (lead, 2026-10-15).
+Config fields `imu.imuN.hg_enabled` (any IMU, off by default; the frame too,
+Isaac 2026-10-15), `imu.hg_range_g` {32, 64, 128, 256, 320} (default 64) and
+`imu.hg_sample_rate_hz` {480, 960, 1920, 3840, 7680} (default 960) are
+parsed, validated per P2/P3 and healed per F10. Sensitivities are the
+datasheet's typical values (0.976 / 1.952 / 3.904 / 7.808 / 10.417 mg/LSB);
+re-check against the PDF on bring-up, since ±320 g is not 320/32768. Not yet
+enabled on the chip: that lands with F12's writer.
+
+### F12 — `.idl1` session files. FINAL (Isaac, 2026-10-15).
+IDL1 hardware writes `.idl1` files with their own format; `.idl0` schema 3
+stays frozen for IDL0 boards. Spec: idl1-app
+`docs/superpowers/specs/2026-10-15-idl1-file-format-DRAFT.md` (approved).
+In short:
+- IMU timing comes from the chips' clocks: FIFO timestamp words every 32
+  samples (`DEC_32`) and one TIMESTAMP-register read per drain.
+- One IMU_BLOCK record per IMU per drain: read instant, chip time at the
+  read, the raw low-g and high-g samples, and the timestamp words.
+- GPS_FIX carries HDOP; slow channels keep per-sample timestamps.
+- Diagnostics are written as they happen (LOGGER_EVENT, rate-limited) plus
+  a SESSION_SUMMARY. This relaxes "raw capture only" for these records.
+- Channel ids: 0–17 IMU axes, 18–26 high-g, 32–47 fixed board inputs,
+  64+ user channels.
+The idl-rs parser shipped first (idl1-app, 2026-10-15). This decision
+supersedes F3 for IDL1 boards: new sensors now go into `.idl1`.
+`idl1_format.c` is the encoder (host test `test/test_idl1_format.c`).

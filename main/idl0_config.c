@@ -78,6 +78,8 @@ static void fill_defaults(idl0_config_t *cfg)
     cfg->gyro_range_dps[2]    = IDL1_IMU_DEFAULT_GYRO_RANGE_DPS;
     cfg->high_performance_mode = true;
     cfg->imu_enabled[0] = cfg->imu_enabled[1] = cfg->imu_enabled[2] = true;
+    cfg->hg_sample_rate_hz    = IDL1_IMU_DEFAULT_HG_ODR_HZ;
+    cfg->hg_range_g           = IDL1_IMU_DEFAULT_HG_RANGE_G;
     cfg->gps_sample_rate_hz   = 5;
     cfg->imu_channel_mask     = DEFAULT_IMU_MASK;
     cfg->config_crc32         = 0;
@@ -424,6 +426,26 @@ bool idl0_config_load(idl0_config_t *out_config)
             }
         }
 
+        /* High-g range and rate, shared by every IMU (F11). */
+        const cJSON *hg_range = cJSON_GetObjectItemCaseSensitive(imu, "hg_range_g");
+        if (cJSON_IsNumber(hg_range)) {
+            if (accept_or_reject("imu.hg_range_g", hg_range->valueint,
+                                 idl1_imu_hg_range_valid(hg_range->valueint))) {
+                out_config->hg_range_g = (uint16_t)hg_range->valueint;
+            } else {
+                heal_number(hg_range, out_config->hg_range_g, &healed);
+            }
+        }
+        const cJSON *hg_rate = cJSON_GetObjectItemCaseSensitive(imu, "hg_sample_rate_hz");
+        if (cJSON_IsNumber(hg_rate)) {
+            if (accept_or_reject("imu.hg_sample_rate_hz", hg_rate->valueint,
+                                 idl1_imu_hg_odr_valid(hg_rate->valueint))) {
+                out_config->hg_sample_rate_hz = (uint16_t)hg_rate->valueint;
+            } else {
+                heal_number(hg_rate, out_config->hg_sample_rate_hz, &healed);
+            }
+        }
+
         const cJSON *hp = cJSON_GetObjectItemCaseSensitive(imu, "high_performance_mode");
         if (cJSON_IsBool(hp)) {
             out_config->high_performance_mode = cJSON_IsTrue(hp);
@@ -447,6 +469,10 @@ bool idl0_config_load(idl0_config_t *out_config)
             const cJSON *en = cJSON_GetObjectItemCaseSensitive(imu_blk, "enabled");
             if (cJSON_IsBool(en)) {
                 out_config->imu_enabled[i] = cJSON_IsTrue(en);
+            }
+            const cJSON *hg_en = cJSON_GetObjectItemCaseSensitive(imu_blk, "hg_enabled");
+            if (cJSON_IsBool(hg_en)) {
+                out_config->hg_enabled[i] = cJSON_IsTrue(hg_en);
             }
             const cJSON *ar = cJSON_GetObjectItemCaseSensitive(imu_blk, "accel_range_g");
             if (cJSON_IsNumber(ar)) {

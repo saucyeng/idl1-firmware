@@ -57,11 +57,29 @@ static int test_gyro(void) {
     return 0;
 }
 
+static int test_high_g(void) {
+    static const int odr_ok[] = { 480, 960, 1920, 3840, 7680 };
+    for (unsigned i = 0; i < 5; i++) CHECK(idl1_imu_hg_odr_valid(odr_ok[i]));
+    static const int odr_bad[] = { 0, 15, 240, 481, 833 };
+    for (unsigned i = 0; i < 5; i++) CHECK(!idl1_imu_hg_odr_valid(odr_bad[i]));
+    static const int fs_ok[] = { 32, 64, 128, 256, 320 };
+    for (unsigned i = 0; i < 5; i++) CHECK(idl1_imu_hg_range_valid(fs_ok[i]));
+    CHECK(!idl1_imu_hg_range_valid(16));
+    CHECK(!idl1_imu_hg_range_valid(300));
+    CHECK(near(idl1_imu_hg_g_per_lsb(64), 0.001952f));
+    CHECK(near(idl1_imu_hg_g_per_lsb(320), 0.010417f));
+    CHECK(idl1_imu_hg_g_per_lsb(100) == 0.0f);
+    CHECK(idl1_imu_hg_odr_valid(IDL1_IMU_DEFAULT_HG_ODR_HZ));
+    CHECK(idl1_imu_hg_range_valid(IDL1_IMU_DEFAULT_HG_RANGE_G));
+    return 0;
+}
+
 int main(void)
 {
-    if (test_odr())   return 1;
-    if (test_accel()) return 1;
-    if (test_gyro())  return 1;
+    if (test_odr())    return 1;
+    if (test_accel())  return 1;
+    if (test_gyro())   return 1;
+    if (test_high_g()) return 1;
     printf("PASS — %d checks\n", g_checks);
     return 0;
 }
