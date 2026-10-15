@@ -45,6 +45,7 @@ typedef struct {
     bool     gyro_fresh;
     uint32_t reuse_count;          /* accels paired with a stale gyro, count */
     uint32_t unknown_count;        /* unrecognised FIFO tags, count */
+    int8_t   freq_fine;            /* INTERNAL_FREQ_FINE at init (F12) */
 } imu_chip_instance_t;
 
 /* Identify and configure one LSM6DSV320X. WHO_AM_I is read before any
@@ -59,8 +60,9 @@ typedef struct {
  * before they get here); an off-list value fails init instead of being
  * remapped. high_performance selects the operating mode (see
  * imu_chip_resolve_op_mode_xl()). hg_enabled / hg_sample_rate_hz (Hz) /
- * hg_range_g (g) are the high-g stream parameters; high-g lands in bring-up
- * phase 3 and is not enabled yet — pass false.
+ * hg_range_g (g) enable the high-g accelerometer into the FIFO (F11). The
+ * timestamp counter runs and a timestamp word is batched every 32 samples
+ * (F12); FREQ_FINE is read into the instance.
  *
  * Returns true with per_state = OK; false with ABSENT (not a DSV320X /
  * no answer) or ERROR (a configuration write failed). */
@@ -87,13 +89,19 @@ uint16_t imu_chip_fifo_count(stmdev_ctx_t *ctx, imu_chip_instance_t *inst);
 /* Burst-drain the FIFO: one bus transaction for up to min(level,
  * IMU_CHIP_BURST_MAX_WORDS, max_pairs) words, then pair gyro -> accel words
  * in memory. Returns the (gyro, accel) pairs written to `out`. High-g
- * triplets (tag 0x1D) go to out_hg (bounded by max_hg, count in *n_hg) and
- * never touch the pair builder; out_hg may be NULL while high-g is off.
+ * triplets (tag 0x1D) and timestamp words (tag 0x04) go to `extra` (either
+ * buffer may be NULL), the words with their position in the drain; neither
+ * touches the pair builder.
  * Marks the instance ERROR and returns 0 on a bus failure. Single caller
  * (the IMU task): uses one static burst buffer. */
 size_t imu_chip_drain(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
                       idl0_imu_sample_t *out, size_t max_pairs,
-                      int16_t out_hg[][3], size_t max_hg, size_t *n_hg);
+                      idl1_imu_drain_extra_t *extra);
+
+/* The chip's TIMESTAMP register. Marks the instance ERROR and returns false
+ * on a bus failure. */
+bool imu_chip_read_timestamp(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
+                             uint32_t *chip_ts);
 
 /* Was the FIFO overrun flag latched since the last call? Clears it. */
 bool imu_chip_check_overrun(imu_chip_instance_t *inst);

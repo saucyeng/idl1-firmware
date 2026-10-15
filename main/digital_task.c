@@ -9,7 +9,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-#include "idl0_format.h"
+#include "idl1_format.h"
 #include "pins.h"
 #include "writer_task.h"
 
@@ -45,10 +45,10 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
 
 /* Submit one CHANNEL_SAMPLE record (u8 press counter) via the writer.
  * Builds the framed record on the stack. */
-static void submit_press_record(uint8_t channel_id, int64_t ts_us, uint8_t value) {
-    /* 3-byte framing + 1 channel_id + 8 timestamp_us + 1 value = 13 bytes max. */
+static void submit_press_record(uint16_t channel_id, int64_t ts_us, uint8_t value) {
+    /* 3-byte framing + 2 channel_id + 8 timestamp_us + 1 value = 14 bytes. */
     uint8_t buf[16];
-    const size_t n = idl0_format_channel_sample(buf, channel_id, ts_us,
+    const size_t n = idl1_format_channel_sample(buf, channel_id, ts_us,
                                                 &value, sizeof(value));
     if (n == 0) return;
     if (!idl0_writer_submit(buf, n)) {

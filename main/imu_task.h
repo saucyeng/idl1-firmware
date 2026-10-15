@@ -68,3 +68,20 @@ idl0_imu_probe_t idl0_imu_task_probe(uint8_t imu_index);
  * (imu_driver.c / imu_driver_i2c.c) can race the drain loop into a
  * use-after-free on the handle. */
 void idl0_imu_task_reinit_failed(void);
+
+/* Writes any rate-limited LOGGER_EVENTs still waiting (F12); `force` writes
+ * them regardless of the one-per-second limit. The session layer forces a
+ * flush just before SESSION_SUMMARY. */
+void idl1_imu_flush_events(bool force);
+
+/* This session's counters for SESSION_SUMMARY (F12): per IMU FIFO
+ * overruns, times it stopped answering, and samples written; writer-ring
+ * drops; the slowest poll cycle, µs. */
+void idl1_imu_session_stats(uint32_t overruns[IDL0_IMU_COUNT],
+                            uint32_t bus_errors[IDL0_IMU_COUNT],
+                            uint32_t samples[IDL0_IMU_COUNT],
+                            uint32_t *writer_drops, uint32_t *slowest_cycle_us);
+
+/* IMU `imu_index`'s INTERNAL_FREQ_FINE at its last init, for the .idl1
+ * header (0 if never read). */
+int8_t idl1_imu_task_freq_fine(uint8_t imu_index);

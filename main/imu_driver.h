@@ -53,13 +53,40 @@ typedef struct {
     uint8_t who_am_i;  /* raw WHO_AM_I byte; valid only when ANSWERED */
 } idl0_imu_probe_t;
 
-/* One drained low-g/gyro sample, ready to be timestamped + framed by
- * imu_task. High-g (pods, phase 3) is not a field here: it lands as
- * separate CHANNEL_SAMPLE records on registry channels 24-29. */
+/* One drained low-g/gyro sample, framed by imu_task into an .idl1
+ * IMU_BLOCK (F12). The field order is the file's axis order (accel X/Y/Z,
+ * gyro X/Y/Z), so a drain's samples go into the record with one copy. */
 typedef struct {
     int16_t accel[3];  /* X, Y, Z — raw int16 LSB, no scaling */
     int16_t gyro[3];   /* X, Y, Z — raw int16 LSB */
 } idl0_imu_sample_t;
+
+/* High-g accelerometer settings for one IMU (F11). */
+typedef struct {
+    bool     enabled;
+    uint16_t rate_hz;    /* {480, 960, 1920, 3840, 7680} */
+    uint16_t range_g;    /* {32, 64, 128, 256, 320} */
+} idl1_imu_hg_cfg_t;
+
+/* One FIFO timestamp word as drained (F12): the chip's timestamp counter,
+ * and how many low-g samples and high-g triplets this drain produced
+ * before it. The word stamps the next low-g sample. */
+typedef struct {
+    uint16_t after_pairs;
+    uint16_t after_hg;
+    uint32_t chip_ts;
+} idl1_imu_ts_t;
+
+/* A drain's outputs besides the low-g/gyro pairs. Either buffer may be
+ * NULL with a zero max, which discards that kind of word. */
+typedef struct {
+    int16_t      (*hg)[3];
+    size_t        max_hg;
+    size_t        n_hg;      /* out */
+    idl1_imu_ts_t *ts;
+    size_t        max_ts;
+    size_t        n_ts;      /* out */
+} idl1_imu_drain_extra_t;
 
 /* Aggregate state — see enum doc above.
  * T32: this aggregates only the SPI driver's IMUs (IMU0). With IMU1/IMU2 on
@@ -105,7 +132,15 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
                        uint16_t sample_rate_hz,
                        uint8_t accel_range_g,
                        uint16_t gyro_range_dps,
-                       bool high_performance);
+                       bool high_performance,
+                       const idl1_imu_hg_cfg_t *hg);   /* NULL = high-g off */
+
+/* The chip's TIMESTAMP register (F12), read once per drain to tie its
+ * clock to esp_timer. False if the IMU isn't active or the read failed. */
+bool idl0_imu_read_chip_ts(uint8_t imu_index, uint32_t *chip_ts);
+
+/* The chip's INTERNAL_FREQ_FINE at the last init (0 if never read). */
+int8_t idl0_imu_freq_fine(uint8_t imu_index);
 
 /* WHO_AM_I probe result of the last idl0_imu_init_one() for this index.
  * NOT_RUN for out-of-range or never-initialised indices. */
@@ -121,7 +156,8 @@ uint16_t idl0_imu_fifo_count(uint8_t imu_index);
  * per-word tag+data reads, removing the per-transaction overhead that made the
  * SPI drain dominate the poll cycle. Latches the overrun flag and carries the
  * pending gyro across calls. Returns the number of pairs written to `out`. */
-size_t idl0_imu_drain(uint8_t imu_index, idl0_imu_sample_t *out, size_t max_pairs);
+size_t idl0_imu_drain(uint8_t imu_index, idl0_imu_sample_t *out, size_t max_pairs,
+                      idl1_imu_drain_extra_t *extra);
 
 /* Was this IMU's FIFO overrun bit set since the last call? Clears on
  * read. Used by imu_task to log overruns (§5.5: not written to file). */

@@ -9,7 +9,7 @@
 #include "freertos/task.h"
 
 #include "gps_driver.h"
-#include "idl0_format.h"
+#include "idl1_format.h"
 #include "mode_state.h"
 #include "session.h"
 #include "status.h"
@@ -44,8 +44,8 @@ static uint32_t s_diag_rx_sentences;
 
 static void emit_fix(const idl0_gps_fix_t *fix)
 {
-    uint8_t buf[40];
-    size_t n = idl0_format_gps_fix(buf,
+    uint8_t buf[IDL1_RECORD_FRAME_BYTES + IDL1_GPS_FIX_PAYLOAD];
+    size_t n = idl1_format_gps_fix(buf,
                                    fix->gps_epoch_ms,
                                    fix->device_timestamp_us,
                                    fix->latitude_e7,
@@ -54,7 +54,8 @@ static void emit_fix(const idl0_gps_fix_t *fix)
                                    fix->speed_x100,
                                    fix->heading_x100,
                                    fix->fix_quality,
-                                   fix->satellites);
+                                   fix->satellites,
+                                   fix->hdop_x100);
     if (!idl0_writer_submit(buf, n)) {
         s_diag_writer_drops++;
     }

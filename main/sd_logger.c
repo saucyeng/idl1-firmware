@@ -214,7 +214,7 @@ bool idl0_sd_open_session(int64_t boot_ms)
     mkdir(IDL0_SD_MOUNT_POINT "/sessions", 0777);
 
     snprintf(s_file_path, sizeof(s_file_path),
-             IDL0_SD_MOUNT_POINT "/sessions/tmp_%lld.idl0", (long long)boot_ms);
+             IDL0_SD_MOUNT_POINT "/sessions/tmp_%lld.idl1", (long long)boot_ms);
     s_file = fopen(s_file_path, "wb");
     if (s_file == NULL) {
         ESP_LOGE(TAG, "open_session: fopen %s failed", s_file_path);
@@ -303,7 +303,7 @@ bool idl0_sd_rename_with_timestamp(int64_t utc_seconds)
     gmtime_r(&t, &tm_utc);
     char new_path[64];
     strftime(new_path, sizeof(new_path),
-             IDL0_SD_MOUNT_POINT "/sessions/%Y-%m-%d_%H-%M-%S.idl0", &tm_utc);
+             IDL0_SD_MOUNT_POINT "/sessions/%Y-%m-%d_%H-%M-%S.idl1", &tm_utc);
 
     bool ok = false;
     if (file_lock("rename")) {

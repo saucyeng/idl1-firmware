@@ -457,3 +457,18 @@ In short:
 The idl-rs parser shipped first (idl1-app, 2026-10-15). This decision
 supersedes F3 for IDL1 boards: new sensors now go into `.idl1`.
 `idl1_format.c` is the encoder (host test `test/test_idl1_format.c`).
+
+**F12 writer landed (2026-10-15).** The firmware writes `.idl1`:
+- The chip runs its timestamp counter and batches a timestamp word every 32
+  samples. Each drain records `esp_timer`, then the TIMESTAMP register, then
+  the burst. High-g is enabled on the chip per F11.
+- `imu_task` writes one IMU_BLOCK per drain, the samples copied straight
+  in. LOGGER_EVENTs cover FIFO overruns, writer drops and IMUs lost or
+  recovered, at most one per code and source a second; they replace A5's
+  zero records.
+- The session writes the `.idl1` header (firmware version, FREQ_FINE),
+  SESSION_SUMMARY and SESSION_END.
+- GPS_FIX carries GGA HDOP. HR and markers use 2-byte channel ids, HR on
+  36/37. Files are named `*.idl1`.
+Bench checks: which sample a timestamp word stamps, the high-g sensitivities
+(F11), and pod I²C capacity with the extra 4-byte register read per drain.

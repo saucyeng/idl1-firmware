@@ -213,6 +213,11 @@ bool idl0_nmea_parse_gga(const char *line, idl0_gps_fix_t *fix)
     int sats = atoi(t[7]);
     fix->satellites = (sats < 0) ? 0 : (sats > 255 ? 255 : (uint8_t)sats);
 
+    /* HDOP (F12), x 100 to fit a u16: "0.85" -> 85. */
+    double hdop = (t[8][0] != '\0') ? atof(t[8]) : 0.0;
+    double hdop_x100 = hdop * 100.0 + 0.5;
+    fix->hdop_x100 = (hdop_x100 < 0.0) ? 0 : (hdop_x100 > 65535.0) ? 65535 : (uint16_t)hdop_x100;
+
     double alt = (t[9][0] != '\0') ? atof(t[9]) : 0.0;
     double alt_x10 = alt * 10.0 + (alt >= 0.0 ? 0.5 : -0.5);
     fix->altitude_x10 = (alt_x10 < -32768.0) ? -32768
@@ -264,6 +269,7 @@ bool idl0_gps_feed_line(const char *line, idl0_gps_fix_t *out_fix)
             s_pending.altitude_x10 = 0;
             s_pending.fix_quality  = 0;
             s_pending.satellites   = 0;
+            s_pending.hdop_x100    = 0;
         }
         if (s_state == IDL0_GPS_NOFIX) s_state = IDL0_GPS_FIX;
         *out_fix = s_pending;

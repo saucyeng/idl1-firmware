@@ -22,7 +22,7 @@
 #include "host/ble_hs.h"
 #include "host/ble_uuid.h"
 
-#include "idl0_format.h"
+#include "idl1_format.h"
 #include "mode_state.h"
 #include "session.h"
 #include "status.h"
@@ -301,12 +301,12 @@ static void start_service_discovery(uint16_t conn_handle)
 
 /* Submit one CHANNEL_SAMPLE record via the standard writer pipeline.
  * Builds the framed record on the stack — encoders never allocate. */
-static void submit_channel_sample(uint8_t channel_id, int64_t timestamp_us,
+static void submit_channel_sample(uint16_t channel_id, int64_t timestamp_us,
                                   const void *value, size_t value_len)
 {
-    /* 3-byte framing + 1 channel_id + 8 timestamp_us + 8 max value = 20. */
+    /* 3-byte framing + 2 channel_id + 8 timestamp_us + 8 max value = 21. */
     uint8_t buf[24];
-    size_t n = idl0_format_channel_sample(buf, channel_id, timestamp_us,
+    size_t n = idl1_format_channel_sample(buf, channel_id, timestamp_us,
                                           value, value_len);
     if (n == 0) return;
     if (!idl0_writer_submit(buf, n)) {

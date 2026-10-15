@@ -29,6 +29,7 @@ typedef struct {
     uint16_t heading_x100;
     uint8_t fix_quality;
     uint8_t satellites;
+    uint16_t hdop_x100;   /* GGA HDOP x 100 (F12); 0 when unknown */
 } idl0_gps_fix_t;
 
 /* GPS subsystem state, mapped 1:1 onto the §7.3 GPS: status token. */

@@ -28,7 +28,12 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
                            uint16_t sample_rate_hz,
                            uint8_t accel_range_g,
                            uint16_t gyro_range_dps,
-                           bool high_performance);
+                           bool high_performance,
+                           const idl1_imu_hg_cfg_t *hg);   /* NULL = high-g off */
+
+/* TIMESTAMP register and FREQ_FINE — see the SPI versions in imu_driver.h. */
+bool   idl0_imu_read_chip_ts_i2c(uint8_t imu_index, uint32_t *chip_ts);
+int8_t idl0_imu_freq_fine_i2c(uint8_t imu_index);
 
 /* Per-IMU runtime queries — mirror the SPI versions in imu_driver.h but
  * operate on the I2C adapter's state. */
@@ -51,4 +56,4 @@ void     idl0_imu_take_pair_diag_i2c(uint8_t imu_index, uint32_t *reuse, uint32_
  * (FIFO words stream from 0x78 with auto-increment) — see imu_chip_drain().
  * Returns the number of pairs written to `out`. */
 size_t idl0_imu_drain_i2c(uint8_t imu_index, idl0_imu_sample_t *out,
-                          size_t max_pairs);
+                          size_t max_pairs, idl1_imu_drain_extra_t *extra);

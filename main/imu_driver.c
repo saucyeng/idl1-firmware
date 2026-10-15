@@ -168,7 +168,8 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
                        uint16_t sample_rate_hz,
                        uint8_t accel_range_g,
                        uint16_t gyro_range_dps,
-                       bool high_performance)
+                       bool high_performance,
+                       const idl1_imu_hg_cfg_t *hg)
 {
     if (imu_index >= IDL0_IMU_COUNT) {
         ESP_LOGE(TAG, "init_one: index %u out of range", (unsigned)imu_index);
@@ -216,10 +217,12 @@ bool idl0_imu_init_one(spi_host_device_t spi_host,
     ctx->mdelay    = platform_mdelay;
     ctx->handle    = &s_spi[imu_index];
 
-    /* The onboard IMU never carries high-g (pods only, registry 24-29). */
+    /* High-g on the onboard IMU too, when configured (F11). */
+    const bool hg_on = hg != NULL && hg->enabled;
     const bool ok = imu_chip_init(ctx, &s_chip[imu_index], imu_index, true,
                                   sample_rate_hz, accel_range_g, gyro_range_dps,
-                                  high_performance, false, 0, 0);
+                                  high_performance, hg_on,
+                                  hg_on ? hg->rate_hz : 0, hg_on ? hg->range_g : 0);
     if (!ok && s_chip[imu_index].per_state == IDL0_IMU_ABSENT) {
         /* Not a DSV320X / no answer: leave the bus to the SD card. An ERROR
          * (config write failed) keeps the device for the T31 retry. */
@@ -245,11 +248,23 @@ uint16_t idl0_imu_fifo_count(uint8_t imu_index)
     return imu_chip_fifo_count(&s_ctx[imu_index], &s_chip[imu_index]);
 }
 
-size_t idl0_imu_drain(uint8_t imu_index, idl0_imu_sample_t *out, size_t max_pairs)
+size_t idl0_imu_drain(uint8_t imu_index, idl0_imu_sample_t *out, size_t max_pairs,
+                      idl1_imu_drain_extra_t *extra)
 {
     if (imu_index >= IDL0_IMU_COUNT) return 0;
-    return imu_chip_drain(&s_ctx[imu_index], &s_chip[imu_index],
-                          out, max_pairs, NULL, 0, NULL);
+    return imu_chip_drain(&s_ctx[imu_index], &s_chip[imu_index], out, max_pairs, extra);
+}
+
+bool idl0_imu_read_chip_ts(uint8_t imu_index, uint32_t *chip_ts)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return false;
+    return imu_chip_read_timestamp(&s_ctx[imu_index], &s_chip[imu_index], chip_ts);
+}
+
+int8_t idl0_imu_freq_fine(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return 0;
+    return s_chip[imu_index].freq_fine;
 }
 
 bool idl0_imu_check_overrun(uint8_t imu_index)

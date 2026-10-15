@@ -14,6 +14,7 @@
 #include "esp_log.h"
 
 #include "idl0_format.h"
+#include "idl1_format.h"
 #include "imu_ranges.h"
 #include "sd_logger.h"
 
@@ -85,8 +86,8 @@ static void fill_defaults(idl0_config_t *cfg)
     cfg->config_crc32         = 0;
     /* HRM disabled by default; channel IDs match spec §5.2 so status.c
      * and session.c can reference them even with no strap configured. */
-    cfg->hrm.hr_channel_id    = 22;
-    cfg->hrm.rr_channel_id    = 23;
+    cfg->hrm.hr_channel_id    = IDL1_CH_HR_BPM;   /* 36 (F12) */
+    cfg->hrm.rr_channel_id    = IDL1_CH_HR_RR;    /* 37 */
     /* Analog + digital channel arrays default empty — users add entries
      * via the app's `+ Add channel…` flow as hardware lands. */
     cfg->analog_sample_rate_hz = 100;
@@ -226,8 +227,8 @@ static void load_hrm(const cJSON *root, idl0_config_t *cfg)
 {
     /* Default: disabled, channel IDs pinned to spec (§5.2). */
     memset(&cfg->hrm, 0, sizeof(cfg->hrm));
-    cfg->hrm.hr_channel_id = 22;
-    cfg->hrm.rr_channel_id = 23;
+    cfg->hrm.hr_channel_id = IDL1_CH_HR_BPM;
+    cfg->hrm.rr_channel_id = IDL1_CH_HR_RR;
 
     const cJSON *hrm = cJSON_GetObjectItemCaseSensitive(root, "heart_rate_monitor");
     if (!cJSON_IsObject(hrm)) return;

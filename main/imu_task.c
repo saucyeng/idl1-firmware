@@ -1,8 +1,10 @@
-/* IMU polling task — drains all enabled IMUs and emits IMU_SAMPLE
- * records (§5.5) via the shared writer. Three IMUs (§3) are polled
- * sequentially every IMU_POLL_MS; each IMU's read instant is taken
- * just before its own drain so per-sample timestamps are accurate
- * per-instance (no cross-IMU skew).
+/* IMU polling task — drains all enabled IMUs and writes one .idl1
+ * IMU_BLOCK per IMU per drain (F12) via the shared writer. Three IMUs (§3)
+ * are polled sequentially every IMU_POLL_MS. Each drain records its read
+ * instant (esp_timer) beside the chip's own TIMESTAMP register, plus the
+ * raw low-g/gyro samples, high-g triplets and FIFO timestamp words; the
+ * idl-rs parser times every sample from those. No per-sample timestamp
+ * arithmetic happens here.
  */
 
 #include "imu_task.h"
@@ -18,7 +20,7 @@
 
 #include "diag_log.h"
 #include "idl0_config.h"
-#include "idl0_format.h"
+#include "idl1_format.h"
 #include "imu_driver.h"
 #include "imu_driver_i2c.h"
 #include "imu_ranges.h"
@@ -35,6 +37,12 @@
                                       * after a stall instead of leaving residual
                                       * to overflow. */
 #define IMU_DIAG_LOG_PERIOD_MS 5000  /* periodic serial "drained N pairs" log */
+#define IMU_DRAIN_MAX_HG       256   /* high-g triplets per drain (the burst is
+                                      * capped at 256 words, so never more) */
+#define IMU_DRAIN_MAX_TS       16    /* timestamp words per drain: one per 32
+                                      * samples, so 8 at most in a full burst */
+#define IMU_EVENT_MIN_GAP_US   1000000  /* LOGGER_EVENT rate limit, per code
+                                         * and source (F12) */
 
 static const char *TAG = "imu_task";
 
@@ -96,17 +104,13 @@ static bool     s_imu_enabled[IDL0_IMU_COUNT];
 static uint8_t  s_accel_range_g[IDL0_IMU_COUNT];
 static uint16_t s_gyro_range_dps[IDL0_IMU_COUNT];
 static bool     s_high_performance;
+static idl1_imu_hg_cfg_t s_hg[IDL0_IMU_COUNT];   /* F11 */
 
 /* Per-IMU counters for the periodic diagnostic log. Reset on each log emit. */
 static uint32_t s_diag_pairs[IDL0_IMU_COUNT];
 static uint32_t s_diag_overruns[IDL0_IMU_COUNT];
 static uint32_t s_diag_writer_drops;   /* batches the writer rejected this window */
 static int64_t  s_diag_last_log_us;
-
-/* Last timestamp emitted per IMU — used to keep timestamps strictly monotonic
- * (§5.5 back-counting from a jittery per-drain esp_timer snapshot can otherwise
- * step ≤2 ms backwards at a drain boundary on the first-drained IMU). */
-static int64_t s_last_ts[IDL0_IMU_COUNT] = { INT64_MIN, INT64_MIN, INT64_MIN };
 
 /* T41 / decisions.md A5: which IMUs were active when the current session
  * started. Snapshotted by imu_task_fn on the session's not-running ->
@@ -131,60 +135,102 @@ static uint32_t s_m_cycle_max_us;                  /* slowest full poll cycle */
 static uint32_t s_m_writer_drops;
 
 /* Drain scratch — static, shared, single-IMU-at-a-time (the round-robin is
- * serial, so there's no reentrancy). At 256 pairs these are 3 KB + 6 KB;
- * static keeps them off the task stack. `s_batch` holds one IMU_SAMPLE record
- * per pair (24 = max record size). drain_one() emits records to the writer
- * when a session is running, and drains for FIFO hygiene otherwise. */
+ * serial, so there's no reentrancy); static keeps them off the task stack.
+ * `s_block` holds one IMU_BLOCK: framing and header, every axis of a full
+ * burst, the high-g triplets and the timestamp words. */
 static idl0_imu_sample_t s_pairs[IMU_DRAIN_MAX_PAIRS];
-static uint8_t           s_batch[IMU_DRAIN_MAX_PAIRS * 24];
+static int16_t           s_hg_buf[IMU_DRAIN_MAX_HG][3];
+static idl1_imu_ts_t     s_ts_buf[IMU_DRAIN_MAX_TS];
+static idl1_ts_word_t    s_ts_words[IMU_DRAIN_MAX_TS];
+static int16_t           s_packed[IMU_DRAIN_MAX_PAIRS * 6];
+static uint8_t           s_block[IDL1_RECORD_FRAME_BYTES + IDL1_IMU_BLOCK_FIXED_BYTES
+                                 + IMU_DRAIN_MAX_PAIRS * 12 + IMU_DRAIN_MAX_HG * 6
+                                 + IMU_DRAIN_MAX_TS * IDL1_TS_WORD_BYTES];
 
-/* T41 / A5: one zero-filled IMU_SAMPLE for an IMU that was active at
- * session start and is now down, timestamped at this poll. */
-static void emit_zero_record(uint8_t imu_index)
+/* Session counters for SESSION_SUMMARY (F12), beside the s_m_* diag ones. */
+static uint32_t s_m_bus_errors[IDL0_IMU_COUNT];   /* IMU lost mid-session */
+static bool     s_reported_lost[IDL0_IMU_COUNT];
+
+/* LOGGER_EVENT rate limiting (F12): occurrences not yet written, and when
+ * each code/source last wrote one. A code fires at most once a second per
+ * source, carrying the count since its last record; a failed write (the
+ * writer is full) keeps the count for the next try. */
+#define IMU_EVT_CODES 6
+static uint32_t s_evt_pending[IMU_EVT_CODES][IDL0_IMU_COUNT];
+static int64_t  s_evt_last_us[IMU_EVT_CODES][IDL0_IMU_COUNT];
+
+static void flush_event(uint8_t code, uint8_t source, int64_t now_us, bool force)
 {
-    int64_t ts = esp_timer_get_time();
-    if (ts <= s_last_ts[imu_index]) ts = s_last_ts[imu_index] + 1;
-    s_last_ts[imu_index] = ts;
-    static const int16_t zero_axes[6] = {0};
-    uint8_t rec[24];   /* max IMU_SAMPLE record size, bytes */
-    const size_t n = idl0_format_imu_sample(rec, imu_index, ts, s_channel_mask, zero_axes);
-    if (n > 0 && !idl0_writer_submit(rec, n)) {
-        s_m_writer_drops++;
-        s_diag_writer_drops++;
+    uint32_t *pending = &s_evt_pending[code][source];
+    if (*pending == 0) return;
+    if (!force && now_us - s_evt_last_us[code][source] < IMU_EVENT_MIN_GAP_US) return;
+    uint8_t rec[IDL1_RECORD_FRAME_BYTES + IDL1_LOGGER_EVENT_PAYLOAD];
+    const size_t n = idl1_format_logger_event(rec, code, source, *pending, now_us);
+    if (idl0_writer_submit(rec, n)) {
+        *pending = 0;
+        s_evt_last_us[code][source] = now_us;
     }
 }
 
-static void drain_one(uint8_t imu_index, int64_t period_us)
+static void note_event(uint8_t code, uint8_t source, uint32_t count)
 {
-    /* T20: require mask has at least one channel bit set. No registry entries
-     * exist for a maskless IMU — such records would be unexplainable overhead
-     * (~12 bytes every ~20 ms for the session). */
-    uint32_t imu_bits = (s_channel_mask >> (imu_index * 6)) & 0x3Fu;
+    s_evt_pending[code][source] += count;
+    flush_event(code, source, esp_timer_get_time(), false);
+}
+
+static inline bool imu_read_chip_ts(uint8_t i, uint32_t *chip_ts) {
+    return s_imu_bus[i] == IDL0_BUS_I2C
+        ? idl0_imu_read_chip_ts_i2c(i, chip_ts)
+        : idl0_imu_read_chip_ts(i, chip_ts);
+}
+
+static void drain_one(uint8_t imu_index)
+{
+    /* T20: an IMU with no recorded axes has no registry entries; skip it. */
+    const uint32_t imu_bits = (s_channel_mask >> (imu_index * 6)) & 0x3Fu;
     if (imu_bits == 0) return;
+    const bool running = idl0_session_is_running();
     if (!imu_is_active(imu_index)) {
-        if (s_active_at_session_start[imu_index] && idl0_session_is_running()) {
-            emit_zero_record(imu_index);
+        /* T41 / A5, as a LOGGER_EVENT now (F12): say once that an IMU that
+         * was live at session start stopped answering. */
+        if (running && s_active_at_session_start[imu_index] && !s_reported_lost[imu_index]) {
+            s_reported_lost[imu_index] = true;
+            s_m_bus_errors[imu_index]++;
+            note_event(IDL1_EVT_IMU_LOST, imu_index, 1);
         }
         return;
     }
+    if (s_reported_lost[imu_index] && running) {
+        s_reported_lost[imu_index] = false;
+        note_event(IDL1_EVT_IMU_RECOVERED, imu_index, 1);
+    }
 
-    /* Snapshot the read instant before draining so all per-sample
-     * timestamps anchor on the same t_read for this IMU. */
+    /* The clock pair (F12): esp_timer, then the chip's TIMESTAMP register
+     * straight after, so the two describe one instant to within one
+     * register read. */
     const int64_t t_read_us = esp_timer_get_time();
+    uint32_t chip_ts = 0;
+    (void)imu_read_chip_ts(imu_index, &chip_ts);
 
-    /* Both buses now use a single burst transaction (SPI via DMA, I²C via one
-     * multi-byte read) — the per-word SPI loop was removed: its ~2 blocking
-     * transactions/word dominated the poll cycle (see the firmware drop
-     * root-cause doc). */
+    const bool hg_on = s_hg[imu_index].enabled;
+    idl1_imu_drain_extra_t extra = {
+        .hg = hg_on ? s_hg_buf : NULL, .max_hg = hg_on ? IMU_DRAIN_MAX_HG : 0,
+        .ts = s_ts_buf, .max_ts = IMU_DRAIN_MAX_TS,
+    };
+    /* Both buses use a single burst transaction (SPI via DMA, I²C via one
+     * multi-byte read). */
     const size_t n_pairs = (s_imu_bus[imu_index] == IDL0_BUS_I2C)
-        ? idl0_imu_drain_i2c(imu_index, s_pairs, IMU_DRAIN_MAX_PAIRS)
-        : idl0_imu_drain(imu_index, s_pairs, IMU_DRAIN_MAX_PAIRS);
+        ? idl0_imu_drain_i2c(imu_index, s_pairs, IMU_DRAIN_MAX_PAIRS, &extra)
+        : idl0_imu_drain(imu_index, s_pairs, IMU_DRAIN_MAX_PAIRS, &extra);
 
     const int64_t t_after_read = esp_timer_get_time();
 
+    uint8_t flags = 0;
     if (imu_check_overrun(imu_index)) {
+        flags |= 1;
         s_diag_overruns[imu_index]++;
         s_m_overruns[imu_index]++;
+        if (running) note_event(IDL1_EVT_FIFO_OVERRUN, imu_index, 1);
     }
 
     s_diag_pairs[imu_index] += n_pairs;
@@ -197,42 +243,82 @@ static void drain_one(uint8_t imu_index, int64_t period_us)
     s_m_read_sum_us[imu_index] += read_us;
     if (read_us > s_m_read_max_us[imu_index]) s_m_read_max_us[imu_index] = read_us;
 
-    if (n_pairs == 0) goto account_total;
-    if (!idl0_session_is_running()) goto account_total;  /* drained for hygiene */
+    if (!running) goto account_total;  /* drained for hygiene */
+    if (n_pairs == 0 && extra.n_hg == 0) goto account_total;
 
-    /* Walk-back timestamps per §5.5: sample 0 is oldest, sample N-1 is newest
-     * = t_read_us. Records are formatted into one batch buffer and pushed to
-     * the writer as a single ring-buffer item per drain (per-record submits
-     * would flood the writer). A per-IMU monotonic clamp keeps timestamps
-     * strictly increasing across drain boundaries. */
-    size_t batch_len = 0;
-    for (size_t i = 0; i < n_pairs; i++) {
-        int64_t ts = t_read_us - (int64_t)(n_pairs - 1 - i) * period_us;
-        if (ts <= s_last_ts[imu_index]) {
-            ts = s_last_ts[imu_index] + 1;   /* clamp: never step backwards */
+    /* Recorded axes in axis order (F12: any subset; all six is the default,
+     * which goes straight in with no packing). */
+    const int16_t *samples = &s_pairs[0].accel[0];
+    uint8_t low_axes = 6;
+    if (imu_bits != 0x3Fu) {
+        low_axes = 0;
+        for (int a = 0; a < 6; a++) low_axes += (imu_bits >> a) & 1u;
+        size_t k = 0;
+        for (size_t i = 0; i < n_pairs; i++) {
+            const int16_t *axes = &s_pairs[i].accel[0];
+            for (int a = 0; a < 6; a++) {
+                if ((imu_bits >> a) & 1u) s_packed[k++] = axes[a];
+            }
         }
-        s_last_ts[imu_index] = ts;
-        const int16_t axes[6] = {
-            s_pairs[i].accel[0], s_pairs[i].accel[1], s_pairs[i].accel[2],
-            s_pairs[i].gyro[0],  s_pairs[i].gyro[1],  s_pairs[i].gyro[2],
-        };
-        batch_len += idl0_format_imu_sample(
-            s_batch + batch_len, imu_index, ts, s_channel_mask, axes);
+        samples = s_packed;
     }
-    if (batch_len > 0 && !idl0_writer_submit(s_batch, batch_len)) {
-        /* Ring buffer full — count it; do NOT log per drop. A per-batch
-         * ESP_LOGW here floods the UART console (~5 ms/line, blocking) on the
-         * IMU task, which delays the next drain and starves the writer — a
-         * feedback loop that turns a brief backlog into seconds of drops. The
-         * count surfaces in the 5 s diag line and the session-end summary. */
+    for (size_t i = 0; i < extra.n_ts; i++) {
+        s_ts_words[i] = (idl1_ts_word_t){
+            .after_sample = s_ts_buf[i].after_pairs,
+            .after_hg     = s_ts_buf[i].after_hg,
+            .chip_ts      = s_ts_buf[i].chip_ts,
+        };
+    }
+    const size_t len = idl1_format_imu_block(
+        s_block, sizeof(s_block), imu_index, flags, t_read_us, chip_ts,
+        samples, (uint16_t)n_pairs, low_axes,
+        &s_hg_buf[0][0], (uint16_t)extra.n_hg, hg_on ? 3 : 0,
+        s_ts_words, (uint8_t)extra.n_ts);
+    if (len == 0 || !idl0_writer_submit(s_block, len)) {
+        /* Ring buffer full — count it and say so in the file once the writer
+         * has room (LOGGER_EVENT, rate-limited). Never ESP_LOGW per drop: a
+         * per-batch log floods the UART on this task, delays the next drain
+         * and starves the writer — a feedback loop that turns a brief
+         * backlog into seconds of drops. */
         s_m_writer_drops++;
         s_diag_writer_drops++;
+        s_evt_pending[IDL1_EVT_WRITER_DROP][imu_index]++;
     }
 
 account_total:;
     const uint32_t total_us = (uint32_t)(esp_timer_get_time() - t_read_us);
     s_m_total_sum_us[imu_index] += total_us;
     if (total_us > s_m_total_max_us[imu_index]) s_m_total_max_us[imu_index] = total_us;
+}
+
+void idl1_imu_flush_events(bool force)
+{
+    const int64_t now = esp_timer_get_time();
+    for (uint8_t code = 1; code < IMU_EVT_CODES; code++) {
+        for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) flush_event(code, i, now, force);
+    }
+}
+
+void idl1_imu_session_stats(uint32_t overruns[IDL0_IMU_COUNT],
+                            uint32_t bus_errors[IDL0_IMU_COUNT],
+                            uint32_t samples[IDL0_IMU_COUNT],
+                            uint32_t *writer_drops, uint32_t *slowest_cycle_us)
+{
+    for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+        overruns[i]   = s_m_overruns[i];
+        bus_errors[i] = s_m_bus_errors[i];
+        samples[i]    = s_m_pairs[i];
+    }
+    *writer_drops     = s_m_writer_drops;
+    *slowest_cycle_us = s_m_cycle_max_us;
+}
+
+int8_t idl1_imu_task_freq_fine(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return 0;
+    return s_imu_bus[imu_index] == IDL0_BUS_I2C
+        ? idl0_imu_freq_fine_i2c(imu_index)
+        : idl0_imu_freq_fine(imu_index);
 }
 
 /* Zero the session drain accumulators. Called by the session layer at start. */
@@ -245,6 +331,9 @@ void idl0_imu_diag_reset(void)
     memset(s_m_total_max_us,  0, sizeof(s_m_total_max_us));
     memset(s_m_pairs,         0, sizeof(s_m_pairs));
     memset(s_m_overruns,      0, sizeof(s_m_overruns));
+    memset(s_m_bus_errors,    0, sizeof(s_m_bus_errors));
+    memset(s_reported_lost,   0, sizeof(s_reported_lost));
+    memset(s_evt_pending,     0, sizeof(s_evt_pending));
     s_m_cycle_max_us = 0;
     s_m_writer_drops = 0;
     /* Discard pair-builder diagnostics accumulated between sessions so the
@@ -339,7 +428,7 @@ void idl0_imu_task_reinit_failed(void)
             if (!idl0_imu_i2c_init_attempted(i)) continue;  /* never brought up at boot — nothing to retry */
             const bool ok = idl0_imu_init_one_i2c(
                 i, s_imu_i2c_addr[i], s_odr_hz,
-                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance);
+                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance, &s_hg[i]);
             ESP_LOGW(TAG, "IMU%u (I2C) re-init at session start: %s",
                      (unsigned)i, ok ? "recovered" : "still down");
         } else {
@@ -349,7 +438,7 @@ void idl0_imu_task_reinit_failed(void)
             if (idl0_imu_per_state(i) != IDL0_IMU_ERROR) continue;
             const bool ok = idl0_imu_init_one(
                 SPI2_HOST, i, s_odr_hz,
-                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance);
+                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance, &s_hg[i]);
             ESP_LOGW(TAG, "IMU%u (SPI) re-init at session start: %s",
                      (unsigned)i, ok ? "recovered" : "still down");
         }
@@ -396,9 +485,6 @@ static void imu_task_fn(void *arg)
 {
     (void)arg;
 
-    /* Pre-compute the inter-sample period in µs from the configured ODR. */
-    const int64_t period_us = (s_odr_hz > 0) ? (1000000LL / s_odr_hz) : 10000LL;
-
     s_diag_last_log_us = esp_timer_get_time();
     bool prev_wifi = (idl0_mode_get_bits() & IDL0_MODE_BIT_WIFI_UP) != 0;
     int64_t prev_cycle_us = 0;   /* start of the previous drain pass */
@@ -437,8 +523,11 @@ static void imu_task_fn(void *arg)
 
         const int64_t cycle_start_us = esp_timer_get_time();
         for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
-            drain_one(i, period_us);
+            drain_one(i);
         }
+        /* Rate-limited LOGGER_EVENTs that have waited out their gap, or a
+         * writer that was full last time (F12). */
+        if (running) idl1_imu_flush_events(false);
 
         /* Track the slowest full poll cycle (vTaskDelay + the three drains) for
          * the session diag summary — this is the FIFO's unattended window. */
@@ -493,19 +582,24 @@ bool idl0_imu_task_start(void)
         s_imu_enabled[i]    = true;
         s_accel_range_g[i]  = cfg.accel_range_g[i];
         s_gyro_range_dps[i] = cfg.gyro_range_dps[i];
+        s_hg[i] = (idl1_imu_hg_cfg_t){
+            .enabled = cfg.hg_enabled[i],
+            .rate_hz = cfg.hg_sample_rate_hz,
+            .range_g = cfg.hg_range_g,
+        };
         bool ok;
         if (s_imu_bus[i] == IDL0_BUS_I2C) {
             ok = idl0_imu_init_one_i2c(i, s_imu_i2c_addr[i],
                                        cfg.imu_sample_rate_hz,
                                        cfg.accel_range_g[i],
                                        cfg.gyro_range_dps[i],
-                                       cfg.high_performance_mode);
+                                       cfg.high_performance_mode, &s_hg[i]);
         } else {
             ok = idl0_imu_init_one(SPI2_HOST, i,
                                    cfg.imu_sample_rate_hz,
                                    cfg.accel_range_g[i],
                                    cfg.gyro_range_dps[i],
-                                   cfg.high_performance_mode);
+                                   cfg.high_performance_mode, &s_hg[i]);
         }
         if (ok) up++;
     }

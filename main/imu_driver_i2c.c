@@ -82,7 +82,8 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
                            uint16_t sample_rate_hz,
                            uint8_t accel_range_g,
                            uint16_t gyro_range_dps,
-                           bool high_performance)
+                           bool high_performance,
+                           const idl1_imu_hg_cfg_t *hg)
 {
     if (imu_index >= IDL0_IMU_COUNT) {
         ESP_LOGE(TAG, "init_one_i2c: index %u out of range", (unsigned)imu_index);
@@ -135,10 +136,11 @@ bool idl0_imu_init_one_i2c(uint8_t imu_index,
     ctx->mdelay    = platform_mdelay;
     ctx->handle    = &s_i2c[imu_index];
 
-    /* High-g is bring-up phase 3: off for now. */
+    const bool hg_on = hg != NULL && hg->enabled;
     const bool ok = imu_chip_init(ctx, &s_chip[imu_index], imu_index, false,
                                   sample_rate_hz, accel_range_g, gyro_range_dps,
-                                  high_performance, false, 0, 0);
+                                  high_performance, hg_on,
+                                  hg_on ? hg->rate_hz : 0, hg_on ? hg->range_g : 0);
     if (!ok && s_chip[imu_index].per_state == IDL0_IMU_ABSENT) {
         release_device(imu_index);
     }
@@ -189,9 +191,20 @@ void idl0_imu_take_pair_diag_i2c(uint8_t imu_index, uint32_t *reuse, uint32_t *u
 }
 
 size_t idl0_imu_drain_i2c(uint8_t imu_index, idl0_imu_sample_t *out,
-                          size_t max_pairs)
+                          size_t max_pairs, idl1_imu_drain_extra_t *extra)
 {
     if (imu_index >= IDL0_IMU_COUNT) return 0;
-    return imu_chip_drain(&s_ctx[imu_index], &s_chip[imu_index],
-                          out, max_pairs, NULL, 0, NULL);
+    return imu_chip_drain(&s_ctx[imu_index], &s_chip[imu_index], out, max_pairs, extra);
+}
+
+bool idl0_imu_read_chip_ts_i2c(uint8_t imu_index, uint32_t *chip_ts)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return false;
+    return imu_chip_read_timestamp(&s_ctx[imu_index], &s_chip[imu_index], chip_ts);
+}
+
+int8_t idl0_imu_freq_fine_i2c(uint8_t imu_index)
+{
+    if (imu_index >= IDL0_IMU_COUNT) return 0;
+    return s_chip[imu_index].freq_fine;
 }

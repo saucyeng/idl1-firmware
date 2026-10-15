@@ -15,9 +15,34 @@ static const char *TAG = "imu_chip";
 /* FIFO tags (FIFO_DATA_OUT_TAG bits [7:3]). */
 #define TAG_GY_NC   0x01u
 #define TAG_XL_NC   0x02u
-#define TAG_XL_HG   0x1Du   /* high-g triplet — phase 3 */
+#define TAG_XL_HG   0x1Du   /* high-g triplet (F11) */
+#define TAG_TS      0x04u   /* timestamp word (F12) */
 
 /* ---- value -> register code, valid lists only (imu_ranges.h) ------------ */
+
+static bool hg_odr_code(uint16_t hz, lsm6dsv320x_hg_xl_data_rate_t *odr)
+{
+    switch (hz) {
+        case 480:  *odr = LSM6DSV320X_HG_XL_ODR_AT_480Hz;  return true;
+        case 960:  *odr = LSM6DSV320X_HG_XL_ODR_AT_960Hz;  return true;
+        case 1920: *odr = LSM6DSV320X_HG_XL_ODR_AT_1920Hz; return true;
+        case 3840: *odr = LSM6DSV320X_HG_XL_ODR_AT_3840Hz; return true;
+        case 7680: *odr = LSM6DSV320X_HG_XL_ODR_AT_7680Hz; return true;
+        default:   return false;
+    }
+}
+
+static bool hg_fs_code(uint16_t g, lsm6dsv320x_hg_xl_full_scale_t *fs)
+{
+    switch (g) {
+        case 32:  *fs = LSM6DSV320X_32g;  return true;
+        case 64:  *fs = LSM6DSV320X_64g;  return true;
+        case 128: *fs = LSM6DSV320X_128g; return true;
+        case 256: *fs = LSM6DSV320X_256g; return true;
+        case 320: *fs = LSM6DSV320X_320g; return true;
+        default:  return false;
+    }
+}
 
 static bool odr_code(uint16_t hz, lsm6dsv320x_data_rate_t *odr,
                      lsm6dsv320x_fifo_xl_batch_t *xl_bdr,
@@ -141,12 +166,13 @@ bool imu_chip_init(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
         return false;
     }
 
-    if (hg_enabled) {
-        /* High-g (CTRL1_XL_HG, XL_HG_BATCH_EN) is bring-up phase 3. */
-        ESP_LOGW(TAG, "IMU%u: high-g requested (%u Hz, %u g) but not implemented "
-                      "until phase 3; left off", (unsigned)imu_index,
-                 (unsigned)hg_sample_rate_hz, (unsigned)hg_range_g);
-        hg_enabled = false;
+    lsm6dsv320x_hg_xl_data_rate_t hg_odr = LSM6DSV320X_HG_XL_ODR_OFF;
+    lsm6dsv320x_hg_xl_full_scale_t hg_fs = LSM6DSV320X_64g;
+    if (hg_enabled && (!hg_odr_code(hg_sample_rate_hz, &hg_odr) || !hg_fs_code(hg_range_g, &hg_fs))) {
+        ESP_LOGE(TAG, "IMU%u init: off-list high-g setting (%u Hz, %u g) — not remapped",
+                 (unsigned)imu_index, (unsigned)hg_sample_rate_hz, (unsigned)hg_range_g);
+        inst->per_state = IDL0_IMU_ERROR;
+        return false;
     }
 
     /* Software reset (ST's sequence powers the sensors down first and polls
@@ -183,6 +209,24 @@ bool imu_chip_init(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
     CHIP_CFG("xl_setup", lsm6dsv320x_xl_setup(ctx, odr, xl_mode));
     CHIP_CFG("gy_setup", lsm6dsv320x_gy_setup(ctx, odr, gy_mode));
 
+    /* High-g (F11): full scale, rate, and batched into the FIFO at its ODR
+     * (it has no BDR of its own, P1). With it on, the low-g mode above is
+     * already high-performance (imu_chip_resolve_op_mode_xl). */
+    if (hg_enabled) {
+        CHIP_CFG("hg_xl_full_scale_set", lsm6dsv320x_hg_xl_full_scale_set(ctx, hg_fs));
+        CHIP_CFG("hg_xl_data_rate_set", lsm6dsv320x_hg_xl_data_rate_set(ctx, hg_odr, PROPERTY_ENABLE));
+        CHIP_CFG("fifo_hg_xl_batch_set", lsm6dsv320x_fifo_hg_xl_batch_set(ctx, PROPERTY_ENABLE));
+    }
+
+    /* Chip timing (F12): run the timestamp counter and batch a timestamp
+     * word every 32 low-g/gyro samples ("the maximum rate between XL and
+     * GYRO BDR divided by decimation" — high-g never changes the count). */
+    CHIP_CFG("timestamp_set", lsm6dsv320x_timestamp_set(ctx, PROPERTY_ENABLE));
+    CHIP_CFG("fifo_timestamp_batch_set",
+             lsm6dsv320x_fifo_timestamp_batch_set(ctx, LSM6DSV320X_TMSTMP_DEC_32));
+    int8_t freq_fine = 0;
+    inst->freq_fine = (lsm6dsv320x_odr_cal_reg_get(ctx, &freq_fine) == 0) ? freq_fine : 0;
+
     /* FIFO: batch both at the ODR, continuous (STREAM) mode. */
     CHIP_CFG("fifo_xl_batch_set", lsm6dsv320x_fifo_xl_batch_set(ctx, xl_bdr));
     CHIP_CFG("fifo_gy_batch_set", lsm6dsv320x_fifo_gy_batch_set(ctx, gy_bdr));
@@ -194,11 +238,13 @@ bool imu_chip_init(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
     inst->reuse_count   = 0;
     inst->unknown_count = 0;
     inst->per_state     = IDL0_IMU_OK;
-    ESP_LOGI(TAG, "IMU%u up (%s): ODR=%u Hz, accel ±%u g, gyro ±%u dps, %s",
+    ESP_LOGI(TAG, "IMU%u up (%s): ODR=%u Hz, accel ±%u g, gyro ±%u dps, %s, "
+                  "high-g %s, freq_fine %d",
              (unsigned)imu_index, is_spi_bus ? "SPI" : "I2C",
              (unsigned)sample_rate_hz, (unsigned)accel_range_g,
              (unsigned)gyro_range_dps,
-             high_performance ? "high-performance" : "low-power where allowed");
+             high_performance ? "high-performance" : "low-power where allowed",
+             hg_enabled ? "on" : "off", (int)inst->freq_fine);
     return true;
 }
 
@@ -220,11 +266,25 @@ uint16_t imu_chip_fifo_count(stmdev_ctx_t *ctx, imu_chip_instance_t *inst)
  * reentrancy. */
 static uint8_t s_burst[IMU_CHIP_BURST_MAX_WORDS * 7];
 
+bool imu_chip_read_timestamp(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
+                             uint32_t *chip_ts)
+{
+    if (inst->per_state != IDL0_IMU_OK) return false;
+    if (lsm6dsv320x_timestamp_raw_get(ctx, chip_ts) != 0) {
+        inst->per_state = IDL0_IMU_ERROR;
+        return false;
+    }
+    return true;
+}
+
 size_t imu_chip_drain(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
                       idl0_imu_sample_t *out, size_t max_pairs,
-                      int16_t out_hg[][3], size_t max_hg, size_t *n_hg)
+                      idl1_imu_drain_extra_t *extra)
 {
-    if (n_hg != NULL) *n_hg = 0;
+    if (extra != NULL) {
+        extra->n_hg = 0;
+        extra->n_ts = 0;
+    }
     if (inst->per_state != IDL0_IMU_OK || max_pairs == 0) return 0;
 
     const uint16_t level = imu_chip_fifo_count(ctx, inst);
@@ -269,11 +329,21 @@ size_t imu_chip_drain(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
             memcpy(out[n_pairs].gyro,  inst->pending_gyro, sizeof(out[n_pairs].gyro));
             memcpy(out[n_pairs].accel, data, sizeof(out[n_pairs].accel));
             n_pairs++;
-        } else if (tag == TAG_XL_HG && out_hg != NULL && n_hg != NULL) {
+        } else if (tag == TAG_XL_HG) {
             /* Self-contained X/Y/Z triplet; never touches the pair builder. */
-            if (*n_hg < max_hg) {
-                memcpy(out_hg[*n_hg], data, 6);
-                (*n_hg)++;
+            if (extra != NULL && extra->hg != NULL && extra->n_hg < extra->max_hg) {
+                memcpy(extra->hg[extra->n_hg], data, 6);
+                extra->n_hg++;
+            }
+        } else if (tag == TAG_TS) {
+            /* TIMESTAMP[31:0] in the word's first four bytes, little-endian
+             * like the ESP32. It precedes the samples of its batch event, so
+             * it stamps the next pair. */
+            if (extra != NULL && extra->ts != NULL && extra->n_ts < extra->max_ts) {
+                idl1_imu_ts_t *t = &extra->ts[extra->n_ts++];
+                t->after_pairs = (uint16_t)n_pairs;
+                t->after_hg    = (uint16_t)extra->n_hg;
+                memcpy(&t->chip_ts, data, 4);
             }
         } else {
             inst->unknown_count++;

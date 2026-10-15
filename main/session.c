@@ -9,6 +9,7 @@
 
 #include "session.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -23,7 +24,8 @@
 #include "gps_task.h"
 #include "hrm_task.h"
 #include "idl0_config.h"
-#include "idl0_format.h"
+#include "esp_app_desc.h"
+#include "idl1_format.h"
 #include "imu_ranges.h"
 #include "imu_task.h"
 #include "led_status.h"
@@ -102,18 +104,29 @@ static const struct {
     { "IMU2_GyroZ",  "dps", true  },
 };
 
-/* Maximum registry entries:
- *   18 IMU axes (channel IDs 0-17)
- *   2  HRM (channel IDs 22, 23) when enabled
- *   N  analog channels (user-added, ANALOG_MAX_CHANNELS=8, IDs 32+)
- *   M  digital channels (user-added, DIGITAL_MAX_CHANNELS=4, IDs after analog)
- *
- * Worst case 18 + 2 + 8 + 4 = 32. */
-#define SESSION_REGISTRY_MAX 32
+/* Maximum registry entries (F12):
+ *   18 low-g/gyro axes (channel ids 0-17)
+ *    9 high-g axes (ids 18-26) for IMUs with high-g on
+ *    2 HRM (ids 36, 37) when enabled
+ *    8 analog + 4 digital user channels (ids 64+)
+ * Worst case 18 + 9 + 2 + 8 + 4 = 41. */
+#define SESSION_REGISTRY_MAX 48
 
-/* First channel_id assigned to user-added (analog/digital) channels. Skips
- * the §5.2-reserved range 18-31 (wheels at 18-19, HRM at 22-23, headroom). */
-#define SESSION_USER_CHANNEL_ID_BASE 32
+/* First channel id for user-added analog/digital channels (F12: 64+). */
+#define SESSION_USER_CHANNEL_ID_BASE IDL1_CH_USER_BASE
+
+/* Registry and header buffers. Static: 48 x 52 bytes is too much for the
+ * caller's stack (session start runs on the NimBLE host or button task),
+ * and only one session starts at a time. */
+static idl1_registry_entry_t s_registry[SESSION_REGISTRY_MAX];
+static uint8_t s_header[IDL1_HEADER_FIXED_BYTES + SESSION_REGISTRY_MAX * IDL1_REGISTRY_ENTRY_BYTES + 4];
+
+/* Copies `src` into a fixed-width name or units field, NUL-terminated. */
+static void set_str(char *dst, size_t width, const char *src)
+{
+    strncpy(dst, src, width - 1);
+    dst[width - 1] = '\0';
+}
 
 bool idl0_session_start(void)
 {
@@ -141,64 +154,74 @@ bool idl0_session_start(void)
      * an IMU dropped out of every session for the rest of boot. */
     idl0_imu_task_reinit_failed();
 
-    /* Build the channel registry.  One entry per enabled IMU axis (mask bit
-     * set); channel_id equals the bit position (0-17).  Disabled axes get no
-     * entry; registry_count reflects only the entries that are present. */
-    idl0_channel_registry_entry_t registry[SESSION_REGISTRY_MAX];
-    uint8_t registry_count = 0;
-
+    /* Build the channel registry (F12). One entry per recorded low-g/gyro
+     * axis (channel id = mask bit, 0-17), one per high-g axis of an IMU with
+     * high-g on (18-26), then HRM and the user channels. */
+    uint16_t registry_count = 0;
     for (int bit = 0; bit < 18; bit++) {
-        if (!(cfg.imu_channel_mask & (1u << bit))) {
-            continue;  /* axis disabled — no registry entry */
-        }
-
-        int imu_index  = bit / 6;  /* 0, 1, or 2 */
-        bool is_gyro   = s_imu_axis_meta[bit].is_gyro;
-
-        idl0_channel_registry_entry_t *e = &registry[registry_count++];
+        if (!(cfg.imu_channel_mask & (1u << bit))) continue;
+        const int imu_index = bit / 6;
+        const bool is_gyro  = s_imu_axis_meta[bit].is_gyro;
+        idl1_registry_entry_t *e = &s_registry[registry_count++];
         memset(e, 0, sizeof(*e));
-        e->channel_id      = (uint8_t)bit;
-        e->data_type       = 4;   /* i16 */
-        e->sample_rate_hz  = cfg.imu_sample_rate_hz;
+        e->channel_id = (uint16_t)bit;
+        e->data_type  = 4;   /* i16 */
+        e->kind       = IDL1_KIND_IMU_AXIS;
+        e->source     = (uint8_t)imu_index;
+        e->axis       = (uint8_t)(bit % 6);
+        e->path       = IDL1_PATH_LOW_G;
+        e->rate_mhz   = (uint32_t)cfg.imu_sample_rate_hz * 1000u;
         e->scale = is_gyro
             ? idl1_imu_gyro_dps_per_lsb(cfg.gyro_range_dps[imu_index])
             : idl1_imu_accel_g_per_lsb(cfg.accel_range_g[imu_index]);
-        e->offset = 0.0f;
-        /* name and units: zero-filled by memset; strncpy leaves the rest 0. */
-        strncpy((char *)e->name,  s_imu_axis_meta[bit].name,  sizeof(e->name)  - 1);
-        strncpy((char *)e->units, s_imu_axis_meta[bit].units, sizeof(e->units) - 1);
+        set_str(e->name, sizeof(e->name), s_imu_axis_meta[bit].name);
+        set_str(e->units, sizeof(e->units), s_imu_axis_meta[bit].units);
+    }
+    static const char *const hg_axis_name[3] = { "HgAccelX", "HgAccelY", "HgAccelZ" };
+    for (int imu = 0; imu < 3; imu++) {
+        const uint32_t imu_bits = (cfg.imu_channel_mask >> (imu * 6)) & 0x3Fu;
+        if (!cfg.hg_enabled[imu] || !cfg.imu_enabled[imu] || imu_bits == 0) continue;
+        for (int axis = 0; axis < 3; axis++) {
+            idl1_registry_entry_t *e = &s_registry[registry_count++];
+            memset(e, 0, sizeof(*e));
+            e->channel_id = (uint16_t)(IDL1_CH_HIGH_G_BASE + imu * 3 + axis);
+            e->data_type  = 4;   /* i16 */
+            e->kind       = IDL1_KIND_IMU_AXIS;
+            e->source     = (uint8_t)imu;
+            e->axis       = (uint8_t)axis;
+            e->path       = IDL1_PATH_HIGH_G;
+            e->rate_mhz   = (uint32_t)cfg.hg_sample_rate_hz * 1000u;
+            e->scale      = idl1_imu_hg_g_per_lsb(cfg.hg_range_g);
+            snprintf(e->name, sizeof(e->name), "IMU%d_%s", imu, hg_axis_name[axis]);
+            set_str(e->units, sizeof(e->units), "g");
+        }
     }
 
-    /* HRM channels (§5.2): channel 22 (HR_BPM, u8, 1 Hz) and channel
-     * 23 (HR_RR, u16, event-driven). Added only when the strap is
-     * configured and enabled (§8). Disabled HRM produces no registry
-     * entries — and therefore no records, matching the spec. */
+    /* HRM channels: HR_BPM (u8, 1 Hz) and HR_RR (u16, event-driven), only
+     * when the strap is configured and enabled (§8). */
     if (cfg.hrm.enabled && registry_count + 2 <= SESSION_REGISTRY_MAX) {
-        idl0_channel_registry_entry_t *e = &registry[registry_count++];
+        idl1_registry_entry_t *e = &s_registry[registry_count++];
         memset(e, 0, sizeof(*e));
-        e->channel_id     = cfg.hrm.hr_channel_id;   /* 22 */
-        e->data_type      = 0;                       /* u8 */
-        e->sample_rate_hz = 1;
-        e->scale          = 1.0f;
-        e->offset         = 0.0f;
-        strncpy((char *)e->name,  "HR_BPM", sizeof(e->name)  - 1);
-        strncpy((char *)e->units, "bpm",    sizeof(e->units) - 1);
+        e->channel_id = cfg.hrm.hr_channel_id;   /* 36 */
+        e->data_type  = 0;                       /* u8 */
+        e->rate_mhz   = 1000;
+        e->scale      = 1.0f;
+        set_str(e->name, sizeof(e->name), "HR_BPM");
+        set_str(e->units, sizeof(e->units), "bpm");
 
-        e = &registry[registry_count++];
+        e = &s_registry[registry_count++];
         memset(e, 0, sizeof(*e));
-        e->channel_id     = cfg.hrm.rr_channel_id;   /* 23 */
-        e->data_type      = 1;                       /* u16 */
-        e->sample_rate_hz = 0;                       /* event-driven */
-        e->scale          = 1000.0f / 1024.0f;
-        e->offset         = 0.0f;
-        strncpy((char *)e->name,  "HR_RR", sizeof(e->name)  - 1);
-        strncpy((char *)e->units, "ms",    sizeof(e->units) - 1);
+        e->channel_id = cfg.hrm.rr_channel_id;   /* 37 */
+        e->data_type  = 1;                       /* u16 */
+        e->rate_mhz   = 0;                       /* event-driven */
+        e->scale      = 1000.0f / 1024.0f;
+        set_str(e->name, sizeof(e->name), "HR_RR");
+        set_str(e->units, sizeof(e->units), "ms");
     }
 
-    /* User-added analog channels (config.analog.channels[], §8). Channel IDs
-     * assigned from SESSION_USER_CHANNEL_ID_BASE (32) monotonically; the
-     * assigned id is written back into cfg.analog_channels[i].channel_id so
-     * the analog reader knows which id to use when submitting records. */
+    /* User-added analog channels (config.analog.channels[], §8): ids from
+     * SESSION_USER_CHANNEL_ID_BASE (64) upward, written back so the reader
+     * knows which id to submit records under. */
     uint8_t next_user_id = SESSION_USER_CHANNEL_ID_BASE;
     for (size_t i = 0; i < cfg.analog_channel_count; i++) {
         analog_channel_t *a = &cfg.analog_channels[i];
@@ -208,22 +231,19 @@ bool idl0_session_start(void)
             break;
         }
         a->channel_id = next_user_id++;
-
-        idl0_channel_registry_entry_t *e = &registry[registry_count++];
+        idl1_registry_entry_t *e = &s_registry[registry_count++];
         memset(e, 0, sizeof(*e));
-        e->channel_id     = a->channel_id;
-        e->data_type      = 1;                                 /* u16 */
-        e->sample_rate_hz = cfg.analog_sample_rate_hz;
-        e->scale          = a->scale;
-        e->offset         = a->offset;
-        strncpy((char *)e->name,  a->label, sizeof(e->name)  - 1);
-        strncpy((char *)e->units, a->units, sizeof(e->units) - 1);
+        e->channel_id = a->channel_id;
+        e->data_type  = 1;                                          /* u16 */
+        e->rate_mhz   = (uint32_t)cfg.analog_sample_rate_hz * 1000u;
+        e->scale      = a->scale;
+        e->offset     = a->offset;
+        set_str(e->name, sizeof(e->name), a->label);
+        set_str(e->units, sizeof(e->units), a->units);
     }
 
-    /* User-added digital channels (config.digital.channels[], §8). Spec 1
-     * ships kind=marker — u8 event-driven, units 'event', value = press
-     * counter. The assigned channel_id is written back so digital_task can
-     * reference it. */
+    /* User-added digital channels (config.digital.channels[], §8): markers,
+     * u8 event-driven press counters. */
     for (size_t i = 0; i < cfg.digital_channel_count; i++) {
         digital_channel_cfg_t *d = &cfg.digital_channels[i];
         if (!d->enabled) continue;
@@ -232,37 +252,31 @@ bool idl0_session_start(void)
             break;
         }
         d->channel_id = next_user_id++;
-
-        idl0_channel_registry_entry_t *e = &registry[registry_count++];
+        idl1_registry_entry_t *e = &s_registry[registry_count++];
         memset(e, 0, sizeof(*e));
-        e->channel_id     = d->channel_id;
-        e->data_type      = 0;                                 /* u8 */
-        e->sample_rate_hz = 0;                                 /* event-driven */
-        e->scale          = 1.0f;
-        e->offset         = 0.0f;
-        strncpy((char *)e->name,  d->label, sizeof(e->name)  - 1);
-        strncpy((char *)e->units, "event",  sizeof(e->units) - 1);
+        e->channel_id = d->channel_id;
+        e->data_type  = 0;                                          /* u8 */
+        e->rate_mhz   = 0;                                          /* event-driven */
+        e->scale      = 1.0f;
+        set_str(e->name, sizeof(e->name), d->label);
+        set_str(e->units, sizeof(e->units), "event");
     }
 
-    /* Header buffer: 48-byte fixed prefix + SESSION_REGISTRY_MAX × IDL0_REGISTRY_ENTRY_BYTES
-     * per-channel entries + 4-byte end marker.  Derived from the same constants used by
-     * idl0_format_header() so the buffer automatically grows if SESSION_REGISTRY_MAX is raised. */
-#define SESSION_HEADER_BUF_BYTES \
-    (48 + (SESSION_REGISTRY_MAX) * IDL0_REGISTRY_ENTRY_BYTES + 4)
-    uint8_t header[SESSION_HEADER_BUF_BYTES];
-    size_t hlen = idl0_format_header(
-        header, sizeof(header),
+    const int8_t freq_fine[3] = {
+        idl1_imu_task_freq_fine(0), idl1_imu_task_freq_fine(1), idl1_imu_task_freq_fine(2),
+    };
+    const size_t hlen = idl1_format_header(
+        s_header, sizeof(s_header),
         uuid, idl0_device_id_bytes(),
-        0,                         /* session_start_utc — set on first fix */
+        esp_app_get_description()->version,
+        0,                         /* session_start_utc — back-filled from the first fix */
         cfg.config_crc32,
-        cfg.imu_channel_mask,
-        cfg.imu_count,
-        cfg.imu_sample_rate_hz,
-        IDL0_GPS_ACTUAL_RATE_HZ,
-        registry_count, registry);
+        freq_fine,
+        registry_count, s_registry);
+    const uint8_t *header = s_header;
     if (hlen == 0 || !idl0_writer_submit(header, hlen)) {
         ESP_LOGE(TAG, "start: header write failed");
-        /* T44: the just-created tmp_<boot_ms>.idl0 never received usable
+        /* T44: the just-created tmp_<boot_ms>.idl1 never received usable
          * data — discard it instead of close(), which would leave a 0-byte
          * file behind on the card. */
         idl0_sd_discard_session();
@@ -305,7 +319,8 @@ bool idl0_session_start(void)
     s_running = true;
     s_first_fix_anchored = false;
     idl0_led_set(IDL0_LED_BLINK_FAST);
-    ESP_LOGI(TAG, "session started (schema v3, %u registry entries)", registry_count);
+    ESP_LOGI(TAG, "session started (.idl1 v%d, %u registry entries)", IDL1_FORMAT_VERSION,
+             (unsigned)registry_count);
     idl0_mode_set_bits(IDL0_MODE_BIT_LOGGING_ACTIVE);
     idl0_status_publish();
     return true;
@@ -333,10 +348,20 @@ bool idl0_session_stop(void)
     }
 
     digital_task_stop();
-    idl0_session_drain_or_log("SESSION_END submit");
+    idl0_session_drain_or_log("SESSION_SUMMARY submit");
 
-    uint8_t end[3];
-    size_t n = idl0_format_session_end(end);
+    /* F12: any rate-limited LOGGER_EVENTs still waiting, then the session's
+     * counters, then SESSION_END. */
+    idl1_imu_flush_events(true);
+    uint32_t overruns[3], bus_errors[3], samples[3], writer_drops = 0, slowest = 0;
+    idl1_imu_session_stats(overruns, bus_errors, samples, &writer_drops, &slowest);
+    uint8_t summary[IDL1_RECORD_FRAME_BYTES + 1 + 3 * 12 + 8];
+    const size_t sn = idl1_format_session_summary(summary, sizeof(summary), 3, overruns,
+                                                  bus_errors, samples, writer_drops, slowest);
+    if (sn > 0) idl0_writer_submit(summary, sn);
+
+    uint8_t end[IDL1_RECORD_FRAME_BYTES];
+    size_t n = idl1_format_session_end(end);
     idl0_writer_submit(end, n);
     idl0_session_drain_or_log("session close");
     idl0_sd_close_session();
@@ -374,7 +399,7 @@ void idl0_session_on_first_fix(int64_t gps_epoch_ms, int64_t device_timestamp_us
     (void)gps_epoch_ms;
     (void)device_timestamp_us;
 
-    /* Rename tmp_<boot_ms>.idl0 to YYYY-MM-DD_HH-MM-SS.idl0 (§10.2). */
+    /* Rename tmp_<boot_ms>.idl1 to YYYY-MM-DD_HH-MM-SS.idl1 (§10.2). */
     int64_t utc_seconds = gps_epoch_ms / 1000;
     if (idl0_sd_rename_with_timestamp(utc_seconds)) {
         ESP_LOGI(TAG, "session file renamed on first fix (UTC %lld)",
