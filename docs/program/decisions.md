@@ -416,3 +416,17 @@ mutex-guarded). The status buffer grew to 384 bytes and the preferred ATT
 MTU to 512 so one notification carries every line. No charger status pin
 exists on this board, so a charger holding the node at 4.2 V with no cell
 reads as full: hardware fix (charger STAT to a GPIO) for the next spin.
+
+### F10 — a rejected config value is healed in `config.json`. FINAL (lead, 2026-10-15).
+Owner's app showed the frame IMU at 833 Hz and refused to Send because of a
+±32 g accel range. The SD card's `config.json` still held LSM6DSO32 values.
+P2/P3 reject them per field at load and keep the default, but the app's
+config read returns the file verbatim, so it showed values the logger
+wasn't running. Now, when `idl0_config_load` rejects a field, it replaces
+that number in the parsed tree with the value in use and rewrites the file
+through the push path (tmp + rename). The rejected top-level `accel_range_g`
+and `gyro_range_dps` seeds become imu0's value in use, the same rule the
+app's Send applies. The CRC is taken from the new bytes. P2/P3 still hold:
+the value in use is the default or seed, never a nearest neighbour.
+Idempotent: a healed file rejects nothing, so the next load writes nothing.
+The `hg_*` fields are not parsed yet, so not healed (bring-up phase 3).

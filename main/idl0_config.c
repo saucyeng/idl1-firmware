@@ -36,6 +36,16 @@ static bool accept_or_reject(const char *field, int32_t value, bool valid)
     return valid;
 }
 
+/* Self-heal (F10): replace a rejected number in the parsed tree with the
+ * value actually in use, and note that the file needs writing back. After
+ * the write, the app's config read (which returns the file verbatim) shows
+ * what the logger really runs, and the next load rejects nothing. */
+static void heal_number(const cJSON *item, double in_use, bool *healed)
+{
+    cJSON_SetNumberValue((cJSON *)item, in_use);
+    *healed = true;
+}
+
 /* Clamp `value` to [lo, hi] (inclusive). Used for §8 fields the spec leaves
  * a free range rather than a fixed hardware set. Logs field/given/applied
  * on any change. */
@@ -368,34 +378,50 @@ bool idl0_config_load(idl0_config_t *out_config)
         }
     }
 
+    /* Set when a rejected field was replaced in `root` (F10). */
+    bool healed = false;
+
     const cJSON *imu = cJSON_GetObjectItemCaseSensitive(root, "imu");
     if (cJSON_IsObject(imu)) {
         const cJSON *rate = cJSON_GetObjectItemCaseSensitive(imu, "sample_rate_hz");
-        if (cJSON_IsNumber(rate) &&
-            accept_or_reject("imu.sample_rate_hz", rate->valueint,
-                             idl1_imu_odr_valid(rate->valueint))) {
-            out_config->imu_sample_rate_hz = (uint16_t)rate->valueint;
+        if (cJSON_IsNumber(rate)) {
+            if (accept_or_reject("imu.sample_rate_hz", rate->valueint,
+                                 idl1_imu_odr_valid(rate->valueint))) {
+                out_config->imu_sample_rate_hz = (uint16_t)rate->valueint;
+            } else {
+                heal_number(rate, out_config->imu_sample_rate_hz, &healed);
+            }
         }
 
         /* Top-level accel_range_g / gyro_range_dps seed all three slots for
-         * back-compat with config files that lack per-IMU sub-blocks. */
+         * back-compat with config files that lack per-IMU sub-blocks. A
+         * rejected seed is healed after the per-IMU blocks, to imu0's value
+         * in use (the same rule the app's Send applies). */
         const cJSON *arange_top = cJSON_GetObjectItemCaseSensitive(imu, "accel_range_g");
-        if (cJSON_IsNumber(arange_top) &&
-            accept_or_reject("imu.accel_range_g", arange_top->valueint,
-                             idl1_imu_accel_range_valid(arange_top->valueint))) {
-            const uint8_t v = (uint8_t)arange_top->valueint;
-            out_config->accel_range_g[0] = v;
-            out_config->accel_range_g[1] = v;
-            out_config->accel_range_g[2] = v;
+        bool heal_arange_top = false;
+        if (cJSON_IsNumber(arange_top)) {
+            if (accept_or_reject("imu.accel_range_g", arange_top->valueint,
+                                 idl1_imu_accel_range_valid(arange_top->valueint))) {
+                const uint8_t v = (uint8_t)arange_top->valueint;
+                out_config->accel_range_g[0] = v;
+                out_config->accel_range_g[1] = v;
+                out_config->accel_range_g[2] = v;
+            } else {
+                heal_arange_top = true;
+            }
         }
         const cJSON *grange_top = cJSON_GetObjectItemCaseSensitive(imu, "gyro_range_dps");
-        if (cJSON_IsNumber(grange_top) &&
-            accept_or_reject("imu.gyro_range_dps", grange_top->valueint,
-                             idl1_imu_gyro_range_valid(grange_top->valueint))) {
-            const uint16_t v = (uint16_t)grange_top->valueint;
-            out_config->gyro_range_dps[0] = v;
-            out_config->gyro_range_dps[1] = v;
-            out_config->gyro_range_dps[2] = v;
+        bool heal_grange_top = false;
+        if (cJSON_IsNumber(grange_top)) {
+            if (accept_or_reject("imu.gyro_range_dps", grange_top->valueint,
+                                 idl1_imu_gyro_range_valid(grange_top->valueint))) {
+                const uint16_t v = (uint16_t)grange_top->valueint;
+                out_config->gyro_range_dps[0] = v;
+                out_config->gyro_range_dps[1] = v;
+                out_config->gyro_range_dps[2] = v;
+            } else {
+                heal_grange_top = true;
+            }
         }
 
         const cJSON *hp = cJSON_GetObjectItemCaseSensitive(imu, "high_performance_mode");
@@ -423,16 +449,22 @@ bool idl0_config_load(idl0_config_t *out_config)
                 out_config->imu_enabled[i] = cJSON_IsTrue(en);
             }
             const cJSON *ar = cJSON_GetObjectItemCaseSensitive(imu_blk, "accel_range_g");
-            if (cJSON_IsNumber(ar) &&
-                accept_or_reject("imu.imuN.accel_range_g", ar->valueint,
-                                 idl1_imu_accel_range_valid(ar->valueint))) {
-                out_config->accel_range_g[i] = (uint8_t)ar->valueint;
+            if (cJSON_IsNumber(ar)) {
+                if (accept_or_reject("imu.imuN.accel_range_g", ar->valueint,
+                                     idl1_imu_accel_range_valid(ar->valueint))) {
+                    out_config->accel_range_g[i] = (uint8_t)ar->valueint;
+                } else {
+                    heal_number(ar, out_config->accel_range_g[i], &healed);
+                }
             }
             const cJSON *gr = cJSON_GetObjectItemCaseSensitive(imu_blk, "gyro_range_dps");
-            if (cJSON_IsNumber(gr) &&
-                accept_or_reject("imu.imuN.gyro_range_dps", gr->valueint,
-                                 idl1_imu_gyro_range_valid(gr->valueint))) {
-                out_config->gyro_range_dps[i] = (uint16_t)gr->valueint;
+            if (cJSON_IsNumber(gr)) {
+                if (accept_or_reject("imu.imuN.gyro_range_dps", gr->valueint,
+                                     idl1_imu_gyro_range_valid(gr->valueint))) {
+                    out_config->gyro_range_dps[i] = (uint16_t)gr->valueint;
+                } else {
+                    heal_number(gr, out_config->gyro_range_dps[i], &healed);
+                }
             }
             const cJSON *channels_blk =
                 cJSON_GetObjectItemCaseSensitive(imu_blk, "channels");
@@ -444,6 +476,8 @@ bool idl0_config_load(idl0_config_t *out_config)
         if (have_per_imu_channels) {
             out_config->imu_channel_mask = mask;
         }
+        if (heal_arange_top) heal_number(arange_top, out_config->accel_range_g[0], &healed);
+        if (heal_grange_top) heal_number(grange_top, out_config->gyro_range_dps[0], &healed);
 
         /* Back-compat: old schema had imu.channels.imuN (flat channels block).
          * Only falls back if no per-IMU sub-blocks provided a channels object. */
@@ -477,6 +511,24 @@ bool idl0_config_load(idl0_config_t *out_config)
         const cJSON *sbas = cJSON_GetObjectItemCaseSensitive(gps, "sbas_enabled");
         if (cJSON_IsBool(sbas)) {
             out_config->sbas_enabled = cJSON_IsTrue(sbas);
+        }
+    }
+
+    /* F10: write the healed tree back, through the same tmp+rename path a
+     * config push uses, and take the CRC from the new bytes so this boot's
+     * sessions name the file as it now is (§5.1). A failed write only
+     * leaves the stale file in place; the values in use are unaffected. */
+    if (healed) {
+        char *text = cJSON_PrintUnformatted(root);
+        if (text != NULL) {
+            const size_t text_len = strlen(text);
+            if (idl0_config_write_json(text, text_len) == IDL0_CONFIG_WRITE_OK) {
+                out_config->config_crc32 = idl0_format_crc32((const uint8_t *)text, text_len);
+                ESP_LOGW(TAG, "config: rejected values replaced with the ones in use; file rewritten");
+            } else {
+                ESP_LOGW(TAG, "config: could not rewrite the healed file");
+            }
+            cJSON_free(text);
         }
     }
 
