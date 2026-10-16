@@ -641,12 +641,33 @@ static esp_err_t ping_get_handler(httpd_req_t *req)
  * so WiFi owns the radio outright (SPEC §10.4). Respond before
  * suspending: the 200 is the contract, and the suspend has no bearing
  * on it. Idempotent — a second call finds BLE already suspended. */
+/* Runs the BLE suspend off the httpd task. The httpd server has a single
+ * task: when the suspend ran inline here and the NimBLE call blocked,
+ * every later request (the download, the OTA body, POST /wifi_off) waited
+ * forever, and the failsafe's httpd_stop() then joined that blocked task,
+ * so the logger stayed in WiFi mode with BLE off (2026-10-16 field runs).
+ * A throwaway task means a slow BLE stack can only delay the suspend. */
+static void ble_suspend_task(void *arg)
+{
+    (void)arg;
+    /* Let the "ok" reach the phone before the radio changes hands. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+    idl0_ble_suspend();
+    ESP_LOGI(TAG, "/handoff - BLE suspended");
+    vTaskDelete(NULL);
+}
+
 static esp_err_t handoff_post_handler(httpd_req_t *req)
 {
     touch_http_activity();
     httpd_resp_sendstr(req, "ok");
     ESP_LOGI(TAG, "/handoff - dropping BLE (radio handoff)");
-    idl0_ble_suspend();
+    if (idl0_ble_is_suspended()) {
+        return ESP_OK;  /* idempotent */
+    }
+    if (xTaskCreate(ble_suspend_task, "ble_suspend", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "/handoff - suspend task create failed; BLE stays up");
+    }
     return ESP_OK;
 }
 
