@@ -112,20 +112,38 @@ static bool read_file_param(httpd_req_t *req, char *out, size_t out_len)
     return true;
 }
 
+/* Appends `src` to `dst` as a JSON string body (no quotes), escaping `"`,
+ * `\` and control characters; truncates rather than overflow. */
+static void json_escape(char *dst, size_t cap, const char *src)
+{
+    size_t o = 0;
+    for (const char *p = src; *p != '\0' && o + 7 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\') {
+            dst[o++] = '\';
+            dst[o++] = (char)c;
+        } else if (c < 0x20) {
+            o += (size_t)snprintf(dst + o, cap - o, "\u%04x", c);
+        } else {
+            dst[o++] = (char)c;
+        }
+    }
+    dst[o] = '\0';
+}
+
+/* GET /files (§6.1). Streamed one entry per chunk: building the whole array
+ * in memory (cJSON) failed with a 500 once the card held many sessions and
+ * WiFi plus BLE had taken the heap (2026-10-16), so nothing here grows with
+ * the number of files. */
 static esp_err_t files_get_handler(httpd_req_t *req)
 {
     touch_http_activity();
-    cJSON *arr = cJSON_CreateArray();
-    if (arr == NULL) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    /* TEMP(idl0-debug): bracket /files enumeration so the serial timestamps
-     * reveal whether the request arrived and how long header reads take.
-     * Remove once the intermittent GET-timeout cause is confirmed. */
     ESP_LOGI(TAG, "GET /files: enumerating");
 
+    httpd_resp_set_type(req, "application/json");
+    if (httpd_resp_send_chunk(req, "[", 1) != ESP_OK) return ESP_FAIL;
+
+    int file_count = 0;
     DIR *dir = opendir(IDL0_SESSIONS_DIR);
     if (dir != NULL) {
         struct dirent *ent;
@@ -138,39 +156,32 @@ static esp_err_t files_get_handler(httpd_req_t *req)
             struct stat st;
             if (stat(path, &st) != 0) continue;
 
-            cJSON *obj = cJSON_CreateObject();
-            cJSON_AddStringToObject(obj, "name", ent->d_name);
-            cJSON_AddNumberToObject(obj, "size", (double)st.st_size);
-
+            char name[160];
+            json_escape(name, sizeof(name), ent->d_name);
             /* session_id lets the app diff device files against its library
              * without downloading them (§6.1). Omitted if the header can't
              * be read; the app then shows the file as identity-unknown. */
             char sid[33];
+            char sid_field[64] = "";
             if (idl0_read_session_id_hex(path, sid)) {
-                cJSON_AddStringToObject(obj, "session_id", sid);
+                snprintf(sid_field, sizeof(sid_field), ",\"session_id\":\"%s\"", sid);
             }
-
-            cJSON_AddItemToArray(arr, obj);
+            char entry[288];
+            int len = snprintf(entry, sizeof(entry), "%s{\"name\":\"%s\",\"size\":%ld%s}",
+                               file_count == 0 ? "" : ",", name, (long)st.st_size, sid_field);
+            if (len < 0 || (size_t)len >= sizeof(entry)) continue;
+            if (httpd_resp_send_chunk(req, entry, len) != ESP_OK) {
+                closedir(dir);
+                return ESP_FAIL;
+            }
+            file_count++;
         }
         closedir(dir);
     }
 
-    int file_count = cJSON_GetArraySize(arr);
-    char *body = cJSON_PrintUnformatted(arr);
-    cJSON_Delete(arr);
-    if (body == NULL) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    /* TEMP(idl0-debug): pair with the "enumerating" line above — the gap
-     * between the two timestamps is the firmware's per-file SD read cost. */
-    ESP_LOGI(TAG, "GET /files: sending %d entries", file_count);
-
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
-    free(body);
-    return err;
+    if (httpd_resp_send_chunk(req, "]", 1) != ESP_OK) return ESP_FAIL;
+    ESP_LOGI(TAG, "GET /files: sent %d entries", file_count);
+    return httpd_resp_send_chunk(req, NULL, 0);  /* end of chunked stream */
 }
 
 /* 8 KB amortises chunk framing + fread + TCP send overhead. With the
