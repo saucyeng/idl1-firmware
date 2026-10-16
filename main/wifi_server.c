@@ -3,7 +3,9 @@
 
 #include "wifi_server.h"
 
+#include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_app_desc.h"
@@ -233,7 +235,13 @@ static esp_err_t download_get_handler(httpd_req_t *req)
 
     FILE *f = fopen(path, "rb");
     if (f == NULL) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "fopen failed");
+        /* Name the cause in the body (the app shows it): "Too many open
+         * files" means max_files is exhausted by a leaked handle. */
+        int err = errno;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "fopen failed: %s (errno %d)", strerror(err), err);
+        ESP_LOGE(TAG, "/download %s: %s", fname, msg);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, msg);
         return ESP_FAIL;
     }
     if (start > 0) {
