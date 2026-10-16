@@ -30,6 +30,7 @@
 #include "imu_task.h"
 #include "led_status.h"
 #include "mode_state.h"
+#include "pins.h"
 #include "sd_logger.h"
 #include "status.h"
 #include "wifi_server.h"
@@ -107,9 +108,10 @@ static const struct {
 /* Maximum registry entries (F12):
  *   18 low-g/gyro axes (channel ids 0-17)
  *    9 high-g axes (ids 18-26) for IMUs with high-g on
+ *    2 wheel (ids 32, 33) when enabled
  *    2 HRM (ids 36, 37) when enabled
  *    8 analog + 4 digital user channels (ids 64+)
- * Worst case 18 + 9 + 2 + 8 + 4 = 41. */
+ * Worst case 18 + 9 + 2 + 2 + 8 + 4 = 43. */
 #define SESSION_REGISTRY_MAX 48
 
 /* First channel id for user-added analog/digital channels (F12: 64+). */
@@ -197,6 +199,40 @@ bool idl0_session_start(void)
         }
     }
 
+    /* Wheel speed (PT18, spec §5.2 / §8): WheelFront 32, WheelRear 33, u32
+     * monotonic pulse count, one event-driven CHANNEL_SAMPLE per tooth.
+     * Handed to digital_task alongside the markers below. */
+    digital_channel_cfg_t digital[DIGITAL_TASK_MAX_CHANNELS];
+    size_t digital_count = 0;
+    static const struct {
+        uint16_t   channel_id;
+        gpio_num_t pin;
+        const char *name;
+    } wheel_meta[2] = {
+        { IDL1_CH_WHEEL_FRONT, IDL1_PIN_WHEEL_F, "WheelFront" },
+        { IDL1_CH_WHEEL_REAR,  IDL1_PIN_WHEEL_R, "WheelRear"  },
+    };
+    for (int w = 0; w < 2; w++) {
+        if (!cfg.wheel_enabled[w]) continue;
+        idl1_registry_entry_t *e = &s_registry[registry_count++];
+        memset(e, 0, sizeof(*e));
+        e->channel_id = wheel_meta[w].channel_id;
+        e->data_type  = 2;   /* u32 */
+        e->rate_mhz   = 0;   /* event-driven */
+        e->scale      = 1.0f;
+        set_str(e->name, sizeof(e->name), wheel_meta[w].name);
+        set_str(e->units, sizeof(e->units), "pulse");
+
+        digital_channel_cfg_t *d = &digital[digital_count++];
+        memset(d, 0, sizeof(*d));
+        d->enabled         = true;
+        d->kind            = DIGITAL_KIND_WHEEL;
+        d->gpio_pin        = wheel_meta[w].pin;
+        d->min_interval_us = DIGITAL_WHEEL_MIN_INTERVAL_US;
+        d->channel_id      = (uint8_t)wheel_meta[w].channel_id;
+        set_str(d->label, sizeof(d->label), wheel_meta[w].name);
+    }
+
     /* HRM channels: HR_BPM (u8, 1 Hz) and HR_RR (u16, event-driven), only
      * when the strap is configured and enabled (§8). */
     if (cfg.hrm.enabled && registry_count + 2 <= SESSION_REGISTRY_MAX) {
@@ -260,6 +296,7 @@ bool idl0_session_start(void)
         e->scale      = 1.0f;
         set_str(e->name, sizeof(e->name), d->label);
         set_str(e->units, sizeof(e->units), "event");
+        digital[digital_count++] = *d;
     }
 
     const int8_t freq_fine[3] = {
@@ -309,11 +346,11 @@ bool idl0_session_start(void)
      * "logging active" and start touching digital_task state; allocating
      * after that point races them against a still-forming task. Failure
      * semantics unchanged: digital_task_start logs and returns on error,
-     * leaving markers disabled for the session — start proceeds regardless.
-     * digital_task_start is idempotent and bails when count==0, so this is
-     * a no-op for profiles without markers. The channel_ids were just
-     * assigned above in the registry loop. */
-    digital_task_start(cfg.digital_channels, cfg.digital_channel_count);
+     * leaving markers and wheels disabled for the session — start proceeds
+     * regardless. digital_task_start is idempotent and bails when count==0,
+     * so this is a no-op for profiles without markers or wheels. The
+     * channel_ids were just assigned above in the registry loops. */
+    digital_task_start(digital, digital_count);
 
     s_started_us = esp_timer_get_time();
     s_running = true;

@@ -93,6 +93,12 @@ typedef struct {
     size_t digital_channel_count;
     digital_channel_cfg_t digital_channels[DIGITAL_MAX_CHANNELS];
 
+    /* Wheel speed (§8 `wheel_speed.front/rear.enabled`, PT18). Index 0 =
+     * front (IDL1_PIN_WHEEL_F), 1 = rear (IDL1_PIN_WHEEL_R). Off by default.
+     * points_per_revolution and wheel_circumference_mm stay in the JSON for
+     * the app: speed is computed app-side, so the firmware never reads them. */
+    bool wheel_enabled[2];
+
     /* Computed */
     uint32_t config_crc32;
 } idl0_config_t;

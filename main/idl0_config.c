@@ -223,6 +223,21 @@ static bool parse_hex_addr_le(const char *s, uint8_t *out)
     return true;
 }
 
+/* Parse `wheel_speed.front/rear.enabled` (§8). A missing block or slot
+ * leaves that wheel off. */
+static void load_wheel_speed(const cJSON *root, idl0_config_t *cfg)
+{
+    const cJSON *ws = cJSON_GetObjectItemCaseSensitive(root, "wheel_speed");
+    if (!cJSON_IsObject(ws)) return;
+    static const char *const slot_keys[2] = { "front", "rear" };
+    for (int i = 0; i < 2; i++) {
+        const cJSON *slot = cJSON_GetObjectItemCaseSensitive(ws, slot_keys[i]);
+        if (!cJSON_IsObject(slot)) continue;
+        const cJSON *en = cJSON_GetObjectItemCaseSensitive(slot, "enabled");
+        cfg->wheel_enabled[i] = cJSON_IsTrue(en);
+    }
+}
+
 static void load_hrm(const cJSON *root, idl0_config_t *cfg)
 {
     /* Default: disabled, channel IDs pinned to spec (§5.2). */
@@ -527,6 +542,7 @@ bool idl0_config_load(idl0_config_t *out_config)
     load_hrm(root, out_config);
     load_analog(root, out_config);
     load_digital(root, out_config);
+    load_wheel_speed(root, out_config);
 
     const cJSON *gps = cJSON_GetObjectItemCaseSensitive(root, "gps");
     if (cJSON_IsObject(gps)) {
