@@ -119,11 +119,11 @@ static void json_escape(char *dst, size_t cap, const char *src)
     size_t o = 0;
     for (const char *p = src; *p != '\0' && o + 7 < cap; p++) {
         unsigned char c = (unsigned char)*p;
-        if (c == '"' || c == '\') {
-            dst[o++] = '\';
+        if (c == '"' || c == '\\') {
+            dst[o++] = '\\';
             dst[o++] = (char)c;
         } else if (c < 0x20) {
-            o += (size_t)snprintf(dst + o, cap - o, "\u%04x", c);
+            o += (size_t)snprintf(dst + o, cap - o, "\\u%04x", c);
         } else {
             dst[o++] = (char)c;
         }
