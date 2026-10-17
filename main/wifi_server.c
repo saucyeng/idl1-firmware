@@ -42,8 +42,23 @@
 #include "ota_guard.h"
 #include "sd_logger.h"
 #include "session_files.h"
+#include "writer_task.h"
+#include "esp_heap_caps.h"
+
 
 static const char *TAG = "wifi";
+
+/* One line of internal-heap numbers (bytes) at a WiFi milestone: free, the
+ * largest block, the low-water mark, and DMA-capable free (SD reads need a
+ * DMA block). WiFi mode only, never on the logging path. */
+static void log_heap(const char *where)
+{
+    ESP_LOGI(TAG, "heap @%s: free=%u largest=%u min=%u dma=%u", where,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+}
 
 #define IDL0_WIFI_PASSWORD       "datalogger123"
 #define IDL0_WIFI_CHANNEL        1
@@ -288,7 +303,16 @@ static esp_err_t download_get_handler(httpd_req_t *req)
         }
         size_t want = (remaining > (long)sizeof(buf)) ? sizeof(buf) : (size_t)remaining;
         size_t got = fread(buf, 1, want, f);
-        if (got == 0) break;
+        if (got == 0) {
+            /* A read error (an SD read that could not get memory, say) must
+             * not end the chunked stream as if the file were complete: drop
+             * the connection so the client sees a short transfer and
+             * resumes (§6.1). */
+            ESP_LOGE(TAG, "/download %s: read failed with %ld bytes left", fname, remaining);
+            log_heap("download read failed");
+            fclose(f);
+            return ESP_FAIL;
+        }
         if (httpd_resp_send_chunk(req, (const char *)buf, got) != ESP_OK) {
             fclose(f);
             return ESP_FAIL;
@@ -654,6 +678,7 @@ static void ble_suspend_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(50));
     idl0_ble_suspend();
     ESP_LOGI(TAG, "/handoff - BLE suspended");
+    log_heap("handoff");
     vTaskDelete(NULL);
 }
 
@@ -911,6 +936,9 @@ bool idl0_wifi_start(void)
         }
     }
     s_abort_transfers = false;
+    log_heap("wifi start");
+    /* Give the idle recording buffer to WiFi for the length of WiFi mode. */
+    idl0_writer_release();
     if (!ensure_netif() || !ensure_event_loop()) {
         return false;
     }
@@ -1009,6 +1037,7 @@ bool idl0_wifi_start(void)
     s_state = IDL0_WIFI_ON;
     idl0_mode_set_bits(IDL0_MODE_BIT_WIFI_UP);
     ESP_LOGI(TAG, "AP up: SSID=%s, IP=192.168.4.1, HTTP on :80", ssid);
+    log_heap("AP up");
     idl0_diag_log_event("wifi up");
     return true;
 }
@@ -1042,6 +1071,10 @@ bool idl0_wifi_stop(void)
     }
     idl0_mode_clear_bits(IDL0_MODE_BIT_WIFI_UP);
     s_state = IDL0_WIFI_OFF;
+    /* WiFi's memory is back: rebuild the recording buffer before anything
+     * can start a session. */
+    idl0_writer_restore();
+    log_heap("AP down");
     /* §10.4: BLE comes back whenever WiFi mode ends, regardless of which
      * path ended it (BLE CMD_WIFI_OFF pre-handoff, POST /wifi_off, or
      * the no-activity failsafe). No-op if BLE was never suspended. */

@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "writer_task.h"
 #include "freertos/FreeRTOS.h"
 
 #include "ble_service.h"
@@ -135,6 +136,14 @@ bool idl0_session_start(void)
     if (s_running) {
         ESP_LOGW(TAG, "start: already running");
         return true;
+    }
+
+    /* The writer's buffer is released while WiFi mode is up and restored
+     * when it ends; retry here so a failed restore can't silently drop a
+     * whole session. */
+    if (!idl0_writer_restore()) {
+        ESP_LOGE(TAG, "start: no writer buffer (out of memory)");
+        return false;
     }
 
     idl0_config_t cfg;

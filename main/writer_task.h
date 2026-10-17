@@ -31,6 +31,18 @@ bool idl0_writer_submit(const uint8_t *buf, size_t len);
  * empty, false on timeout. */
 bool idl0_writer_drain(uint32_t timeout_ms);
 
+/* Hands the ring buffer's 64 KB back to the heap while WiFi mode is up
+ * (2026-10-16: with WiFi + BLE + the HTTP server the logger ran out of
+ * memory and SD reads for /download failed). Sessions cannot run in WiFi
+ * mode (SPEC §7.2 mutex), so nothing submits meanwhile. Blocks until the
+ * writer task has let go of the buffer (<= ~100 ms). Idempotent. */
+void idl0_writer_release(void);
+
+/* Re-creates the ring buffer after idl0_writer_release(). Called when WiFi
+ * mode ends, and again by idl0_session_start() if that failed. Returns
+ * true when the buffer exists. */
+bool idl0_writer_restore(void);
+
 /* Diagnostic accessor (T05): count of idl0_sd_append failures since the last
  * idl0_writer_diag_reset() call. Units: count (failed appends). */
 uint32_t idl0_writer_diag_append_failures(void);

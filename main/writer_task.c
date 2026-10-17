@@ -6,6 +6,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "sd_logger.h"
@@ -16,6 +17,12 @@ static const char *TAG = "writer";
 
 static RingbufHandle_t s_rb   = NULL;
 static TaskHandle_t    s_task = NULL;
+/* Held by the writer task around each receive/append/return, and by
+ * idl0_writer_release() while it deletes the buffer — so the buffer is
+ * never deleted under the writer. Producers never take it (the logging hot
+ * path stays lock-free); they only run during sessions, and a session
+ * never overlaps a release (WiFi mode). */
+static SemaphoreHandle_t s_rb_lock = NULL;
 
 /* T05 diag: idl0_sd_append failures, counted not logged per-item — the writer
  * is the sole consumer draining at producer batch rate (~20 ms); a per-item
@@ -36,8 +43,16 @@ static void writer_task_fn(void *arg)
     (void)arg;
     int64_t last_flush_us = esp_timer_get_time();
     for (;;) {
+        xSemaphoreTake(s_rb_lock, portMAX_DELAY);
+        RingbufHandle_t rb = s_rb;
+        if (rb == NULL) {
+            /* Released for WiFi mode: idle until it comes back. */
+            xSemaphoreGive(s_rb_lock);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
         size_t item_size = 0;
-        void *item = xRingbufferReceive(s_rb, &item_size, pdMS_TO_TICKS(100));
+        void *item = xRingbufferReceive(rb, &item_size, pdMS_TO_TICKS(100));
         if (item != NULL) {
             if (idl0_sd_append((const uint8_t *)item, item_size)) {
                 s_append_fail_logged = false;
@@ -63,8 +78,9 @@ static void writer_task_fn(void *arg)
                     s_sd_fault = true;
                 }
             }
-            vRingbufferReturnItem(s_rb, item);
+            vRingbufferReturnItem(rb, item);
         }
+        xSemaphoreGive(s_rb_lock);
         /* Periodic durability flush + fsync. idl0_sd_append fills a 16 KB
          * cluster buffer without flushing (so it doesn't hold the shared SPI
          * bus on every batch); idl0_sd_flush pushes that buffer through AND
@@ -85,6 +101,11 @@ bool idl0_writer_init(void)
     if (s_task != NULL) {
         return true;
     }
+    s_rb_lock = xSemaphoreCreateMutex();
+    if (s_rb_lock == NULL) {
+        ESP_LOGE(TAG, "lock create failed");
+        return false;
+    }
     s_rb = xRingbufferCreate(IDL0_WRITER_BUFFER_BYTES, RINGBUF_TYPE_NOSPLIT);
     if (s_rb == NULL) {
         ESP_LOGE(TAG, "ring buffer alloc failed");
@@ -97,6 +118,40 @@ bool idl0_writer_init(void)
     }
     ESP_LOGI(TAG, "writer task up (%u-byte buffer)", IDL0_WRITER_BUFFER_BYTES);
     return true;
+}
+
+void idl0_writer_release(void)
+{
+    if (s_rb_lock == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_rb_lock, portMAX_DELAY);
+    if (s_rb != NULL) {
+        RingbufHandle_t rb = s_rb;
+        s_rb = NULL;
+        vRingbufferDelete(rb);
+        ESP_LOGI(TAG, "ring buffer released (WiFi mode)");
+    }
+    xSemaphoreGive(s_rb_lock);
+}
+
+bool idl0_writer_restore(void)
+{
+    if (s_rb_lock == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_rb_lock, portMAX_DELAY);
+    if (s_rb == NULL) {
+        s_rb = xRingbufferCreate(IDL0_WRITER_BUFFER_BYTES, RINGBUF_TYPE_NOSPLIT);
+        if (s_rb == NULL) {
+            ESP_LOGE(TAG, "ring buffer re-create failed");
+        } else {
+            ESP_LOGI(TAG, "ring buffer restored");
+        }
+    }
+    bool ok = s_rb != NULL;
+    xSemaphoreGive(s_rb_lock);
+    return ok;
 }
 
 bool idl0_writer_submit(const uint8_t *buf, size_t len)
