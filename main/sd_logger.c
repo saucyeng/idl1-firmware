@@ -229,11 +229,17 @@ bool idl0_sd_open_session(int64_t boot_ms)
 
 bool idl0_sd_append(const uint8_t *buf, size_t len)
 {
-    if (s_file == NULL) {
-        return false;
-    }
     bool ok = false;
+    /* s_file is tested only under the lock (2026-10-16). Tested before it,
+     * an append that then waited on the lock behind idl0_sd_close_session()
+     * wrote through the NULL it left (Load access fault right after a
+     * session stop), and one that ran during the first-fix rename's brief
+     * close/reopen dropped its record instead of waiting for the reopen. */
     if (file_lock("append")) {
+        if (s_file == NULL) {
+            xSemaphoreGive(s_file_mutex);
+            return false;
+        }
         /* fwrite into the 16 KB stdio buffer only — no fflush here. stdio
          * writes through to the card a full cluster at a time, and the writer
          * task flushes on a ~1 Hz cadence (idl0_sd_flush) for durability. This
