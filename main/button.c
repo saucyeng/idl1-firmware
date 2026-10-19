@@ -64,7 +64,7 @@ static void toggle_recording(void)
  * in idl1_button_release_sleep_holds() before driving it high. */
 static void power_off(void)
 {
-    ESP_LOGW(TAG, "long press -> POWER OFF");
+    ESP_LOGW(TAG, "POWER OFF");
     if (idl0_session_is_running()) {
         ESP_LOGI(TAG, "stopping session before power off");
         idl0_session_stop();
@@ -153,6 +153,25 @@ static void button_task(void *arg)
             long_fired = true;
             power_off();
         }
+    }
+}
+
+static void power_off_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(300));   /* let the BLE ACK reach the phone */
+    power_off();                      /* does not return */
+}
+
+void idl1_power_off_request(void)
+{
+    static bool requested = false;
+    if (requested) return;
+    requested = true;
+    ESP_LOGW(TAG, "power off requested over BLE");
+    if (xTaskCreate(power_off_task, "power_off", 4096, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "power off task create failed");
+        requested = false;
     }
 }
 

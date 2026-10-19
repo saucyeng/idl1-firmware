@@ -16,6 +16,11 @@
 /* Call once, late in boot. */
 void idl1_button_start(void);
 
+/* Powers the logger off from the app (BLE CMD_POWER_OFF): the long-press
+ * shutdown, run on its own task a moment later so the command's ACK goes
+ * out first. Returns at once. */
+void idl1_power_off_request(void);
+
 /* Call first thing in app_main: releases the PWR_EN deep-sleep hold left by
  * a button power-off so the rail can be driven high again. */
 void idl1_button_release_sleep_holds(void);

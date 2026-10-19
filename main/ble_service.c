@@ -328,7 +328,7 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    if (cmd < IDL0_CMD_WIFI_ON || cmd > IDL0_CMD_FILES_READ_BEGIN) {
+    if (cmd < IDL0_CMD_WIFI_ON || cmd > IDL0_CMD_POWER_OFF) {
         ESP_LOGW(TAG, "unknown control command 0x%02X", cmd);
         return BLE_ATT_ERR_INVALID_PDU;
     }

@@ -33,6 +33,10 @@ typedef enum {
      * FF06 read-back buffer, so the app can spot new sessions without WiFi.
      * Handled in the BLE layer. */
     IDL0_CMD_FILES_READ_BEGIN  = 0x0A,
+    /* Power off (§7.2, added 2026-10-19): the same shutdown as a long button
+     * press — any session is stopped and closed, the rail goes off and the
+     * chip deep-sleeps until the button is pressed. Acked before it runs. */
+    IDL0_CMD_POWER_OFF         = 0x0B,
 } idl0_ble_command_t;
 
 /* Returns the ATT result code that the GATT write response will carry:

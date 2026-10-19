@@ -90,6 +90,10 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
                 ESP_LOGW(TAG, "OTA_CONFIRM with no pending-verify image");
             }
             break;
+        case IDL0_CMD_POWER_OFF:
+            ESP_LOGI(TAG, "command: POWER_OFF");
+            idl1_power_off_request();
+            break;
         case IDL0_CMD_CONFIG_BEGIN:
         case IDL0_CMD_CONFIG_COMMIT:
         case IDL0_CMD_CONFIG_READ_BEGIN:
