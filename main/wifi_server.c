@@ -77,6 +77,12 @@ static bool              s_wifi_inited       = false;
  * idl0_wifi_start(). */
 static volatile bool     s_abort_transfers   = false;
 
+/* For the LEDs (idl0_wifi_activity): when /download or /ota last moved
+ * bytes (esp_timer µs), and whether an OTA image is being checked. */
+static volatile int64_t  s_last_dl_us        = 0;
+static volatile int64_t  s_last_ota_us       = 0;
+static volatile bool     s_ota_verifying     = false;
+
 /* Serialises idl0_wifi_stop() across its callers: the esp_timer task
  * (POST /wifi_off, idl0_wifi_stop_deferred), the failsafe task and, since
  * F7, the button task. Without it two callers could both httpd_stop() the
@@ -317,6 +323,7 @@ static esp_err_t download_get_handler(httpd_req_t *req)
             fclose(f);
             return ESP_FAIL;
         }
+        s_last_dl_us = esp_timer_get_time();
         /* A multi-minute download is activity: without this, a transfer
          * longer than the §10.4 idle window would trip the no-HTTP
          * failsafe arm mid-stream (handlers only touch at request start). */
@@ -542,6 +549,7 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         }
         consec_timeouts = 0;  /* any successful recv resets the streak */
         received += (size_t)n;
+        s_last_ota_us = esp_timer_get_time();
 
         size_t off = 0;
         if (s == NULL) {
@@ -599,7 +607,9 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
 
+    s_ota_verifying = true;
     if (!idl0_ota_end(s)) {
+        s_ota_verifying = false;
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image validation failed");
         return ESP_FAIL;
     }
@@ -611,6 +621,16 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;  /* unreachable */
+}
+
+idl0_wifi_activity_t idl0_wifi_activity(void)
+{
+    if (s_ota_verifying) return IDL0_WIFI_ACT_OTA_VERIFY;
+    if (s_state != IDL0_WIFI_ON) return IDL0_WIFI_ACT_NONE;
+    const int64_t now = esp_timer_get_time();
+    if (s_last_ota_us != 0 && now - s_last_ota_us < 1000000) return IDL0_WIFI_ACT_OTA_RX;
+    if (s_last_dl_us != 0 && now - s_last_dl_us < 300000) return IDL0_WIFI_ACT_TRANSFER;
+    return IDL0_WIFI_ACT_NONE;
 }
 
 /* GET /ping — identity + status (SPEC §6.1). The WiFi-mode status feed

@@ -12,6 +12,7 @@
 
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -41,6 +42,32 @@ static bool                s_init_attempted[IDL0_IMU_COUNT];
 /* --- ST driver platform glue ----------------------------------------------
  * Write = [reg, data...]; read = [reg] then repeated-start read. */
 
+/* Consecutive pod transactions that failed. A transaction cut off mid-byte
+ * can leave a pod holding SDA low, and then every later one fails: both
+ * pods read 0 samples and the LED chip stopped answering until reboot
+ * (2026-10-19). After IDL1_I2C_RECOVER_AFTER failures in a row the bus is
+ * reset (nine SCL pulses free a stuck slave), at most once a second. The
+ * pods keep their configuration, so sampling resumes. */
+#define IDL1_I2C_RECOVER_AFTER 20
+static uint32_t s_consec_fail;
+static int64_t  s_last_recover_us;
+
+static void note_result(esp_err_t err)
+{
+    if (err == ESP_OK) {
+        s_consec_fail = 0;
+        return;
+    }
+    if (++s_consec_fail < IDL1_I2C_RECOVER_AFTER) return;
+    const int64_t now = esp_timer_get_time();
+    if (now - s_last_recover_us < 1000000) return;
+    s_last_recover_us = now;
+    s_consec_fail = 0;
+    esp_err_t rc = i2c_master_bus_reset(idl1_i2c_bus_get());
+    ESP_LOGW(TAG, "I2C: %d failures in a row (%s) - bus reset: %s",
+             IDL1_I2C_RECOVER_AFTER, esp_err_to_name(err), esp_err_to_name(rc));
+}
+
 static int32_t platform_write(void *handle, uint8_t reg,
                               const uint8_t *bufp, uint16_t len)
 {
@@ -50,6 +77,7 @@ static int32_t platform_write(void *handle, uint8_t reg,
     buf[0] = reg;
     memcpy(buf + 1, bufp, len);
     esp_err_t err = i2c_master_transmit(imu->dev, buf, 1 + len, I2C_TIMEOUT_MS);
+    note_result(err);
     return (err == ESP_OK) ? 0 : -1;
 }
 
@@ -59,6 +87,7 @@ static int32_t platform_read(void *handle, uint8_t reg,
     i2c_imu_t *imu = (i2c_imu_t *)handle;
     esp_err_t err = i2c_master_transmit_receive(imu->dev, &reg, 1, bufp, len,
                                                 I2C_TIMEOUT_MS);
+    note_result(err);
     return (err == ESP_OK) ? 0 : -1;
 }
 

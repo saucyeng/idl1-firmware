@@ -255,6 +255,7 @@ void app_main(void)
      * after everything above so it reports their boot results; takes
      * IDL1_BRINGUP_WINDOW_MS to watch GPS traffic. */
     idl1_bringup_report();
+    idl1_board_leds_set_booted();
 
     /* After the self-test, which samples USER_BTN itself. */
     idl1_button_start();

@@ -23,6 +23,16 @@ typedef enum {
 } idl0_wifi_state_t;
 
 idl0_wifi_state_t idl0_wifi_state(void);
+
+/* What WiFi mode is busy with, for the board LEDs. */
+typedef enum {
+    IDL0_WIFI_ACT_NONE = 0,     /* WiFi off, or up and waiting */
+    IDL0_WIFI_ACT_TRANSFER,     /* /download bytes moved in the last 300 ms */
+    IDL0_WIFI_ACT_OTA_RX,       /* firmware image arriving */
+    IDL0_WIFI_ACT_OTA_VERIFY,   /* image received; checking and saving it */
+} idl0_wifi_activity_t;
+
+idl0_wifi_activity_t idl0_wifi_activity(void);
 const char *idl0_wifi_state_str(idl0_wifi_state_t state);
 
 /* Bring up the AP and start the HTTP server. Idempotent — repeated

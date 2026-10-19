@@ -69,7 +69,9 @@ bool tla2528_is_up(void);
 /* Drive the two board LEDs (true = lit). No-op if !tla2528_is_up(). An I2C
  * write failure is logged at warning level and otherwise ignored — the
  * LEDs are indication only. */
-void tla2528_led_set(bool red_on, bool green_on);
+/* Returns false when the write failed (bus busy or the chip didn't answer),
+ * so a caller can retry. */
+bool tla2528_led_set(bool red_on, bool green_on);
 
 /* Copy the boot-probe result into *out (zeroed if init never ran). */
 void tla2528_get_probe(tla2528_probe_t *out);

@@ -171,18 +171,19 @@ bool tla2528_is_up(void)
     return s_probe.configured;
 }
 
-void tla2528_led_set(bool red_on, bool green_on)
+bool tla2528_led_set(bool red_on, bool green_on)
 {
-    if (!s_probe.configured) return;
+    if (!s_probe.configured) return false;
     uint8_t v = s_gpo_value & (uint8_t)~(BIT_LED_RED | BIT_LED_GREEN);
     if (red_on)   v |= BIT_LED_RED;
     if (green_on) v |= BIT_LED_GREEN;
     esp_err_t err = reg_write(REG_GPO_VALUE, v);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "GPO_VALUE write failed: %s", esp_err_to_name(err));
-        return;
+        return false;
     }
     s_gpo_value = v;
+    return true;
 }
 
 void tla2528_get_probe(tla2528_probe_t *out)

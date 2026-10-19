@@ -3,10 +3,11 @@
 #include "board_leds.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/timers.h"
+#include "freertos/task.h"
 
 #include "ble_service.h"
 #include "session.h"
@@ -15,45 +16,85 @@
 
 static const char *TAG = "board_leds";
 
-/* Role update period, ms: also the green blink half-period (1 Hz blink). */
-#define BOARD_LEDS_TICK_MS 500
+/* Pattern step, ms: the finest timing any pattern needs. */
+#define BOARD_LEDS_TICK_MS 100
 
-static TimerHandle_t s_timer;
-static bool s_blink_phase;
-static bool s_have_last;
-static bool s_last_red, s_last_green;
+static TaskHandle_t  s_task;
+static volatile bool s_booted;
 
-/* Runs on the FreeRTOS timer task. Reads three state flags and writes
- * GPO_VALUE only when the pattern changes: at most one ~0.1 ms I2C write
- * per tick while green blinks, none while both LEDs are steady (the usual
- * recording case: phone connected, red + green solid). */
-static void tick_cb(TimerHandle_t t)
+void idl1_board_leds_set_booted(void)
 {
-    (void)t;
-    s_blink_phase = !s_blink_phase;
+    s_booted = true;
+}
 
-    const bool linked = idl0_ble_is_connected() || idl0_wifi_state() == IDL0_WIFI_ON;
-    const bool red    = idl0_session_is_running();
-    const bool green  = linked ? true : s_blink_phase;
+/* (red, green) for tick number `n` (one tick = BOARD_LEDS_TICK_MS). */
+static void pattern(uint32_t n, bool *red, bool *green)
+{
+    const bool linked    = idl0_ble_is_connected() || idl0_wifi_state() == IDL0_WIFI_ON;
+    const bool recording = idl0_session_is_running();
+    const bool slow      = (n / 5) % 2 == 0;            /* 1 Hz, 50 % */
 
-    if (s_have_last && red == s_last_red && green == s_last_green) return;
-    tla2528_led_set(red, green);
-    s_have_last  = true;
-    s_last_red   = red;
-    s_last_green = green;
+    if (!s_booted) {
+        /* Fast alternate: swap every two ticks (200 ms). */
+        *red   = (n / 2) % 2 == 0;
+        *green = !*red;
+        return;
+    }
+
+    switch (idl0_wifi_activity()) {
+        case IDL0_WIFI_ACT_OTA_VERIFY:
+            *red = true;  *green = true;  return;
+        case IDL0_WIFI_ACT_OTA_RX:
+            *red = slow;  *green = !slow; return;
+        case IDL0_WIFI_ACT_TRANSFER:
+            *red = false; *green = n % 2 == 0; return;   /* 5 Hz */
+        case IDL0_WIFI_ACT_NONE:
+        default:
+            break;
+    }
+
+    *red = recording;
+    if (idl0_wifi_state() == IDL0_WIFI_ON) {
+        /* Double-blink once a second: on, off, on, then off for 700 ms. */
+        const uint32_t k = n % 10;
+        *green = (k == 0 || k == 2);
+        return;
+    }
+    *green = linked ? true : slow;
+}
+
+static void leds_task(void *arg)
+{
+    (void)arg;
+    bool have_last = false;
+    bool last_red = false, last_green = false;
+    uint32_t n = 0;
+    for (;;) {
+        bool red = false, green = false;
+        pattern(n++, &red, &green);
+        if (!have_last || red != last_red || green != last_green) {
+            /* Written only on a change: no bus traffic while the pattern
+             * holds (the usual recording case). A failed write leaves
+             * `have_last` false so the next tick tries again. */
+            have_last = tla2528_led_set(red, green);
+            last_red = red;
+            last_green = green;
+        }
+        vTaskDelay(pdMS_TO_TICKS(BOARD_LEDS_TICK_MS));
+    }
 }
 
 void idl1_board_leds_start(void)
 {
-    if (s_timer != NULL) return;
+    if (s_task != NULL) return;
     if (!tla2528_is_up()) {
         ESP_LOGW(TAG, "TLA2528 not up: board LEDs dark, onboard LED only");
         return;
     }
-    s_timer = xTimerCreate("board_leds", pdMS_TO_TICKS(BOARD_LEDS_TICK_MS),
-                           pdTRUE, NULL, tick_cb);
-    if (s_timer == NULL || xTimerStart(s_timer, 0) != pdPASS) {
-        ESP_LOGE(TAG, "LED role timer failed to start; green stays solid");
-        return;
+    /* Priority 3: above the timer service (1), where this used to run and
+     * starved past its I2C timeout, below the IMU drain (5). */
+    if (xTaskCreate(leds_task, "board_leds", 3072, NULL, 3, &s_task) != pdPASS) {
+        ESP_LOGE(TAG, "LED task failed to start; LEDs stay as they are");
+        s_task = NULL;
     }
 }
