@@ -19,6 +19,7 @@
 #include "device_id.h"
 #include "diag_log.h"
 #include "driver/gpio.h"
+#include "esp_system.h"
 #include "gps_task.h"
 #include "hrm_task.h"
 #include "i2c_bus.h"
@@ -116,24 +117,50 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
  * setting. */
 #define IDL1_PWR_EN_SETTLE_MS 50
 
-/* Drive PWR_EN high and leave it there for the life of the firmware.
+/* Time the switched rail is held off at every boot before it comes up, ms.
+ * The TPS22919's 24 ohm quick output discharge empties the rail in a few
+ * ms; the rest is margin so every chip on it sees a full power-on reset. */
+#define IDL1_PWR_EN_OFF_MS 100
+
+/* Shutdown hook: drop the switched rail before esp_restart() resets the
+ * MCU, so the rail goes off cleanly instead of floating (below). */
+static void idl1_power_rail_off_at_restart(void)
+{
+    gpio_set_level(IDL1_PIN_PWR_EN, 0);
+}
+
+/* Power-cycle the switched rail, then drive PWR_EN high and leave it there
+ * for the life of the firmware.
  *
  * U2 (TPS22919) switches +3V3 to every peripheral: GNSS, onboard IMU, SD,
- * TLA2528 (and both board LEDs), both pods, Qwiic. Its ON input is a
- * non-latching level with no pull on the net, so GPIO2 must be an actively
- * driven output from here on. Nothing else in the firmware may reconfigure
- * IDL1_PIN_PWR_EN — no gpio_reset_pin(), no direction change — or the whole board goes dark while the MCU keeps running.
+ * TLA2528 (and both board LEDs), both pods, Qwiic, and the I2C pull-ups
+ * R8/R9. Its ON input is a non-latching level with no pull on the net, so
+ * GPIO2 must be an actively driven output from here on. Nothing else in the
+ * firmware may reconfigure IDL1_PIN_PWR_EN — no gpio_reset_pin(), no
+ * direction change — or the whole board goes dark while the MCU keeps
+ * running.
  *
- * One sanctioned exception: the long-press power-off in button.c drives
- * it low and holds it through deep sleep.
+ * Why the rail is cycled first: across a software reset (OTA, config
+ * apply, panic) GPIO2 is released and ON floats for most of a second, so
+ * the rail sags or glitches rather than switching off. The chips on it then
+ * come back from a brownout, not a power-on: logged on 2026-10-19 after the
+ * beta.12 OTA reboot, the TLA2528 (0x10) and the front pod (0x6A) both
+ * stopped answering while the rear pod (0x6B) came back. The TLA2528 also
+ * decodes ADDR only at power-up (NT1, docs/bringup.md). Holding the rail
+ * off for IDL1_PWR_EN_OFF_MS makes every boot a real power-on for them.
+ * Nothing drives into the rail meanwhile: after reset every MCU pin is an
+ * input, and the I2C pull-ups are on the rail itself.
  *
- * The level is set before the pin is switched to output so the pad never
- * drives low on the way up. INPUT_OUTPUT rather than OUTPUT keeps the input
- * buffer on so the boot self-test can read the pad back; it does not
- * change what the pin drives. */
+ * Sanctioned exceptions to "never touch PWR_EN": this cycle, the restart
+ * hook above, and the long-press power-off in button.c (low, held through
+ * deep sleep).
+ *
+ * INPUT_OUTPUT rather than OUTPUT keeps the input buffer on so the boot
+ * self-test can read the pad back; it does not change what the pin
+ * drives. */
 static void idl1_power_rail_on(void)
 {
-    gpio_set_level(IDL1_PIN_PWR_EN, 1);
+    gpio_set_level(IDL1_PIN_PWR_EN, 0);
     const gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << IDL1_PIN_PWR_EN,
         .mode         = GPIO_MODE_INPUT_OUTPUT,
@@ -142,7 +169,26 @@ static void idl1_power_rail_on(void)
         .intr_type    = GPIO_INTR_DISABLE,
     };
     gpio_config(&cfg);
+    gpio_set_level(IDL1_PIN_PWR_EN, 0);
+    vTaskDelay(pdMS_TO_TICKS(IDL1_PWR_EN_OFF_MS));
     gpio_set_level(IDL1_PIN_PWR_EN, 1);
+    esp_register_shutdown_handler(idl1_power_rail_off_at_restart);
+}
+
+/* Log every address that ACKs on the shared I2C bus, once at boot. Read-only
+ * probes, a few ms in all; tells a wedged chip (answers nowhere) from a
+ * mis-decoded TLA2528 ADDR (answers at 0x11-0x17). */
+static void idl1_i2c_scan_log(i2c_master_bus_handle_t bus)
+{
+    char line[96];
+    int  len = 0;
+    line[0] = '\0';
+    for (uint8_t addr = 0x08; addr < 0x78; addr++) {
+        if (i2c_master_probe(bus, addr, 20) == ESP_OK && len < (int)sizeof(line) - 6) {
+            len += snprintf(line + len, sizeof(line) - len, " 0x%02X", addr);
+        }
+    }
+    ESP_LOGI(TAG, "I2C devices answering:%s", len ? line : " none");
 }
 
 void app_main(void)
@@ -211,6 +257,8 @@ void app_main(void)
     i2c_master_bus_handle_t i2c_bus = idl1_i2c_bus_get();
     if (i2c_bus == NULL) {
         ESP_LOGE(TAG, "I2C bus init failed; pods and TLA2528 unavailable");
+    } else {
+        idl1_i2c_scan_log(i2c_bus);
     }
     if (tla2528_init(i2c_bus, IDL1_I2C_ADDR_TLA)) {
         /* Green = power (H1) from here; board_leds takes over the roles once
