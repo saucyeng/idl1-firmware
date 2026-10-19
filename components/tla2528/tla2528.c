@@ -3,6 +3,8 @@
 #include "tla2528.h"
 
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "tla2528";
 
@@ -16,6 +18,7 @@ static const char *TAG = "tla2528";
 
 /* Registers used in phase 1. The register map ends at 0x12. */
 #define REG_SYSTEM_STATUS  0x00u
+#define REG_GENERAL_CFG    0x01u   /* bit 0 RST: reset all registers */
 #define REG_PIN_CFG        0x05u   /* 1 = channel is GPIO, 0 = analog input */
 #define REG_GPIO_CFG       0x07u   /* 1 = digital output, 0 = digital input */
 #define REG_GPO_DRIVE_CFG  0x09u   /* 1 = push-pull, 0 = open-drain */
@@ -131,6 +134,13 @@ bool tla2528_init(i2c_master_bus_handle_t bus, uint8_t addr)
                       "NT1). ***", addr, esp_err_to_name(err));
         release_device();
         return false;
+    }
+    /* Reset every register first: a restart that doesn't cut the switched
+     * rail (a USB reset, a crash) leaves the chip as the last boot set it,
+     * and on 2026-10-19 such a boot ACKed then refused every GPO write. */
+    if (reg_write(REG_GENERAL_CFG, 0x01u) == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        (void)reg_read(REG_SYSTEM_STATUS, &st);
     }
     s_probe.acked         = true;
     s_probe.system_status = st;

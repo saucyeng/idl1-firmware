@@ -43,6 +43,8 @@
 #include "sd_logger.h"
 #include "session_files.h"
 #include "writer_task.h"
+#include "session.h"
+#include "button.h"
 #include "esp_heap_caps.h"
 
 
@@ -727,6 +729,49 @@ static esp_err_t handoff_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* POST /record (logger link design §7.3, 2026-10-19): what the logger's
+ * button does in WiFi mode — end WiFi mode, then start a session — for an
+ * app that can't reach it over Bluetooth because it was handed off. Runs on
+ * its own task: idl0_wifi_stop() joins the httpd task, so it can't run
+ * here. The "ok" goes first. */
+static void record_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(100));   /* let the 200 flush */
+    idl0_wifi_stop();
+    if (!idl0_session_start()) {
+        ESP_LOGE(TAG, "/record: session did not start");
+    }
+    idl0_status_publish();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t record_post_handler(httpd_req_t *req)
+{
+    touch_http_activity();
+    if (idl0_session_is_running()) {
+        httpd_resp_sendstr(req, "already recording");
+        return ESP_OK;
+    }
+    httpd_resp_sendstr(req, "ok");
+    ESP_LOGI(TAG, "/record - leaving WiFi mode to record");
+    if (xTaskCreate(record_task, "wifi_record", 6144, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "/record: task create failed");
+    }
+    return ESP_OK;
+}
+
+/* POST /power_off (logger link design §7.4): CMD_POWER_OFF for a handed-off
+ * logger. The "ok" goes first; the shutdown task waits 300 ms. */
+static esp_err_t power_off_post_handler(httpd_req_t *req)
+{
+    touch_http_activity();
+    httpd_resp_sendstr(req, "ok");
+    ESP_LOGI(TAG, "/power_off");
+    idl1_power_off_request();
+    return ESP_OK;
+}
+
 /* One-shot timer for deferred AP teardown, shared by POST /wifi_off and
  * idl0_wifi_stop_deferred() (T11). Runs in the esp_timer task — NOT the
  * httpd task, and NOT the BLE/NimBLE host task — because httpd_stop()
@@ -847,14 +892,26 @@ static esp_err_t wifi_off_post_handler(httpd_req_t *req)
 /* §10.4 no-activity failsafe: five minutes with no associated station,
  * or five minutes with no HTTP request, exits WiFi mode autonomously so
  * the device is never stranded in AP mode draining battery. The app's
- * 10 s /ping heartbeat keeps an active link alive indefinitely. */
+ * 10 s /ping heartbeat keeps an active link alive indefinitely.
+ *
+ * Tighter once the phone has shown up (logger link design §7.2,
+ * 2026-10-19), so the logger is back on Bluetooth within seconds when the
+ * phone walks away or the app dies mid-transfer:
+ *   - a station joined and then none for IDL0_WIFI_STA_GONE_US: exit;
+ *   - BLE handed off and no HTTP for IDL0_WIFI_HANDOFF_IDLE_US: exit.
+ * Before any station joins, the five minutes stand (Android's approval
+ * dialog can take a while the first time). */
 #define IDL0_WIFI_IDLE_TIMEOUT_US   (5LL * 60 * 1000 * 1000)
-#define IDL0_WIFI_FAILSAFE_POLL_MS  10000
+#define IDL0_WIFI_STA_GONE_US       (5LL * 1000 * 1000)
+#define IDL0_WIFI_HANDOFF_IDLE_US   (60LL * 1000 * 1000)
+#define IDL0_WIFI_FAILSAFE_POLL_MS  1000
 
 static TaskHandle_t s_failsafe_task = NULL;
 
 /* Last time at least one station was associated (or AP-up time). */
 static int64_t s_last_sta_us = 0;
+/* A station has associated since AP-up. */
+static bool s_sta_seen = false;
 
 static void failsafe_task(void *arg)
 {
@@ -865,13 +922,19 @@ static void failsafe_task(void *arg)
         wifi_sta_list_t stas = {0};
         if (esp_wifi_ap_get_sta_list(&stas) == ESP_OK && stas.num > 0) {
             s_last_sta_us = esp_timer_get_time();
+            s_sta_seen = true;
         }
 
         int64_t now = esp_timer_get_time();
         bool sta_idle  = (now - s_last_sta_us)  > IDL0_WIFI_IDLE_TIMEOUT_US;
         bool http_idle = (now - s_last_http_us) > IDL0_WIFI_IDLE_TIMEOUT_US;
-        if (sta_idle || http_idle) {
+        bool sta_gone  = s_sta_seen && (now - s_last_sta_us) > IDL0_WIFI_STA_GONE_US;
+        bool handoff_idle = idl0_ble_is_suspended() &&
+                            (now - s_last_http_us) > IDL0_WIFI_HANDOFF_IDLE_US;
+        if (sta_idle || http_idle || sta_gone || handoff_idle) {
             ESP_LOGW(TAG, "no-activity failsafe (%s) - exiting WiFi mode",
+                     sta_gone ? "phone left the AP" :
+                     handoff_idle ? "no HTTP for 60 s after handoff" :
                      sta_idle ? "no station for 5 min" : "no HTTP for 5 min");
             /* Clear the handle first so idl0_wifi_stop doesn't try to
              * delete the task it is running on; we self-delete below. */
@@ -909,6 +972,12 @@ static esp_err_t register_endpoints(httpd_handle_t srv)
     static const httpd_uri_t wifi_off_uri = {
         .uri = "/wifi_off", .method = HTTP_POST, .handler = wifi_off_post_handler,
     };
+    static const httpd_uri_t record_uri = {
+        .uri = "/record", .method = HTTP_POST, .handler = record_post_handler,
+    };
+    static const httpd_uri_t power_off_uri = {
+        .uri = "/power_off", .method = HTTP_POST, .handler = power_off_post_handler,
+    };
     esp_err_t err = httpd_register_uri_handler(srv, &files_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(srv, &download_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(srv, &delete_uri);
@@ -917,6 +986,8 @@ static esp_err_t register_endpoints(httpd_handle_t srv)
     if (err == ESP_OK) err = httpd_register_uri_handler(srv, &ping_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(srv, &handoff_uri);
     if (err == ESP_OK) err = httpd_register_uri_handler(srv, &wifi_off_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(srv, &record_uri);
+    if (err == ESP_OK) err = httpd_register_uri_handler(srv, &power_off_uri);
     return err;
 }
 
@@ -1059,6 +1130,7 @@ bool idl0_wifi_start(void)
      * AP-up so a phone that never joins still gets timed out. */
     s_last_http_us = esp_timer_get_time();
     s_last_sta_us  = s_last_http_us;
+    s_sta_seen     = false;
     if (xTaskCreate(failsafe_task, "wifi_failsafe", 4096, NULL, 3,
                     &s_failsafe_task) != pdPASS) {
         ESP_LOGW(TAG, "failsafe task create failed - no idle timeout");
