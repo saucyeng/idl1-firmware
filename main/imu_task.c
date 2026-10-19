@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "driver/spi_master.h"
 
@@ -416,33 +417,90 @@ idl0_imu_state_t idl0_imu_task_state(void)
     return IDL0_IMU_OK;
 }
 
+/* Serialises re-init between the session-start path (BLE task) and the idle
+ * retry in imu_task_fn, so one IMU's device handle is never removed and
+ * re-added by both at once. Created in idl0_imu_task_start(). */
+static SemaphoreHandle_t s_reinit_lock;
+
+/* Re-run init for IMU `i` if it is configured, was brought up at boot and
+ * is latched down now. Returns true if it was retried. Caller holds
+ * s_reinit_lock. *ok_out gets the outcome. */
+static bool reinit_one_if_down(uint8_t i, bool *ok_out)
+{
+    if (!s_imu_enabled[i]) return false;
+    if (s_imu_bus[i] == IDL0_BUS_I2C) {
+        if (idl0_imu_is_active_i2c(i)) return false;        /* already healthy */
+        if (!idl0_imu_i2c_init_attempted(i)) return false;  /* never brought up at boot — nothing to retry */
+        *ok_out = idl0_imu_init_one_i2c(
+            i, s_imu_i2c_addr[i], s_odr_hz,
+            s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance, &s_hg[i]);
+    } else {
+        /* Only a live ERROR latch is worth retrying — ABSENT means the
+         * chip never answered WHO_AM_I at boot (unpopulated/miswired),
+         * which a re-init can't fix. */
+        if (idl0_imu_per_state(i) != IDL0_IMU_ERROR) return false;
+        *ok_out = idl0_imu_init_one(
+            SPI2_HOST, i, s_odr_hz,
+            s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance, &s_hg[i]);
+    }
+    return true;
+}
+
 /* T31 — see imu_task.h doc. Called from idl0_session_start() (session.c),
  * before that session's channel registry is built. */
 void idl0_imu_task_reinit_failed(void)
 {
+    if (s_reinit_lock == NULL) return;
+    xSemaphoreTake(s_reinit_lock, portMAX_DELAY);
     for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
-        if (!s_imu_enabled[i]) continue;
-
-        if (s_imu_bus[i] == IDL0_BUS_I2C) {
-            if (idl0_imu_is_active_i2c(i)) continue;        /* already healthy */
-            if (!idl0_imu_i2c_init_attempted(i)) continue;  /* never brought up at boot — nothing to retry */
-            const bool ok = idl0_imu_init_one_i2c(
-                i, s_imu_i2c_addr[i], s_odr_hz,
-                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance, &s_hg[i]);
-            ESP_LOGW(TAG, "IMU%u (I2C) re-init at session start: %s",
-                     (unsigned)i, ok ? "recovered" : "still down");
-        } else {
-            /* Only a live ERROR latch is worth retrying — ABSENT means the
-             * chip never answered WHO_AM_I at boot (unpopulated/miswired),
-             * which a re-init can't fix. */
-            if (idl0_imu_per_state(i) != IDL0_IMU_ERROR) continue;
-            const bool ok = idl0_imu_init_one(
-                SPI2_HOST, i, s_odr_hz,
-                s_accel_range_g[i], s_gyro_range_dps[i], s_high_performance, &s_hg[i]);
-            ESP_LOGW(TAG, "IMU%u (SPI) re-init at session start: %s",
-                     (unsigned)i, ok ? "recovered" : "still down");
+        bool ok = false;
+        if (reinit_one_if_down(i, &ok)) {
+            ESP_LOGW(TAG, "IMU%u (%s) re-init at session start: %s", (unsigned)i,
+                     s_imu_bus[i] == IDL0_BUS_I2C ? "I2C" : "SPI",
+                     ok ? "recovered" : "still down");
         }
     }
+    xSemaphoreGive(s_reinit_lock);
+}
+
+/* Idle self-heal (2026-10-19): one failed transaction latches an IMU down,
+ * and before this only a session start brought it back, so a single I2C
+ * hiccup at boot left the front pod reading 0 samples until the next ride.
+ * While no session is running the IMU task retries every latched-down IMU
+ * once per IDLE_REINIT_PERIOD_MS. Never during a session: a mid-session
+ * re-init resets the chip's FIFO and timestamp, which the session's time
+ * model does not cover; the session-start re-init still applies. Runs on
+ * the IMU task itself, so it never races drain_one(). Only an IMU that has
+ * been up at least once this boot is retried: an unplugged pod is a normal
+ * configuration and is not probed every second. */
+#define IDLE_REINIT_PERIOD_MS 1000
+static bool    s_was_active[IDL0_IMU_COUNT];
+static bool    s_ever_up[IDL0_IMU_COUNT];
+static int64_t s_last_idle_reinit_us;
+
+static void idle_reinit(int64_t now_us)
+{
+    for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+        const bool active = imu_is_active(i);
+        if (s_was_active[i] && !active) {
+            ESP_LOGW(TAG, "IMU%u stopped answering; retrying every %d ms",
+                     (unsigned)i, IDLE_REINIT_PERIOD_MS);
+        }
+        s_was_active[i] = active;
+        if (active) s_ever_up[i] = true;
+    }
+    if (now_us - s_last_idle_reinit_us < (int64_t)IDLE_REINIT_PERIOD_MS * 1000) return;
+    s_last_idle_reinit_us = now_us;
+    if (xSemaphoreTake(s_reinit_lock, 0) != pdTRUE) return;
+    for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) {
+        bool ok = false;
+        if (!s_ever_up[i]) continue;
+        if (reinit_one_if_down(i, &ok) && ok) {
+            ESP_LOGI(TAG, "IMU%u recovered (idle re-init)", (unsigned)i);
+            s_was_active[i] = true;
+        }
+    }
+    xSemaphoreGive(s_reinit_lock);
 }
 
 bool idl0_imu_task_is_active(uint8_t imu_index)
@@ -543,6 +601,7 @@ static void imu_task_fn(void *arg)
          * same numbers reach the SD diag summary via idl0_imu_diag_flush()
          * at session stop — no information is lost. */
         const int64_t now_us = esp_timer_get_time();
+        if (!running) idle_reinit(now_us);
         if (!idl0_session_is_running() &&
             now_us - s_diag_last_log_us >= (int64_t)IMU_DIAG_LOG_PERIOD_MS * 1000) {
             emit_diag_log(now_us);
@@ -618,6 +677,8 @@ bool idl0_imu_task_start(void)
      *
      * 6 KB stack: the big drain/batch buffers are file-static, so the frame is
      * small; 6 KB keeps comfortable headroom. */
+    s_reinit_lock = xSemaphoreCreateMutex();
+    for (uint8_t i = 0; i < IDL0_IMU_COUNT; i++) s_was_active[i] = imu_is_active(i);
     BaseType_t ok = xTaskCreate(imu_task_fn, "imu", 6144, NULL, 5, &s_task);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed");

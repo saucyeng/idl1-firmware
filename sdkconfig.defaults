@@ -95,3 +95,9 @@ CONFIG_ESP_TIMER_TASK_STACK_SIZE=6144
 # NOTE: bootloader option — devices flashed before this change need one
 # USB flash (the bootloader is never OTA-updated).
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# I2C ISR in IRAM: without it the ISR cannot run while the flash cache is
+# off (NVS writes on a BLE bond, OTA, config save), so an I2C transaction in
+# flight stalls and times out. Those timeouts latched the front pod down and
+# failed TLA2528 LED writes (2026-10-19).
+CONFIG_I2C_ISR_IRAM_SAFE=y
