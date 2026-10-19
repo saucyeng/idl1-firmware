@@ -676,8 +676,19 @@ static void ble_suspend_task(void *arg)
     (void)arg;
     /* Let the "ok" reach the phone before the radio changes hands. */
     vTaskDelay(pdMS_TO_TICKS(50));
-    idl0_ble_suspend();
-    ESP_LOGI(TAG, "/handoff - BLE suspended");
+    /* Suspend only while WiFi mode is still up, under the stop lock: a
+     * starved task (an OTA write holds the CPU) that ran after
+     * idl0_wifi_stop() had already resumed BLE turned Bluetooth off for
+     * good, with WiFi off — the logger stopped advertising until reboot
+     * (2026-10-19). Under the lock, a stop that follows will resume. */
+    xSemaphoreTake(s_stop_lock, portMAX_DELAY);
+    if (s_state == IDL0_WIFI_ON) {
+        idl0_ble_suspend();
+        ESP_LOGI(TAG, "/handoff - BLE suspended");
+    } else {
+        ESP_LOGW(TAG, "/handoff - WiFi already ended; BLE stays up");
+    }
+    xSemaphoreGive(s_stop_lock);
     log_heap("handoff");
     vTaskDelete(NULL);
 }
