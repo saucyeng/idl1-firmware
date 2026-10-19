@@ -98,6 +98,7 @@ static portMUX_TYPE s_status_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool s_suspended = false;
 
 static void start_advertising(void);
+static void start_advertising_at(bool fast);
 
 /* Free the FF05 reassembly buffer and clear its state. Safe to call when no
  * transfer is in flight (idempotent). */
@@ -475,8 +476,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
             if (!s_suspended) {
-                ESP_LOGI(TAG, "advertising complete; restarting");
-                start_advertising();
+                /* The fast phase timed out, or a phone connected: carry on
+                 * slowly (a second phone can still find it). */
+                ESP_LOGI(TAG, "advertising complete (reason %d); slow", event->adv_complete.reason);
+                start_advertising_at(false);
             }
             break;
 
@@ -486,7 +489,21 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
+/* Advertising cadence (logger link design §7.1, Isaac 2026-10-19): fast for
+ * a while after anything that broke the link — boot, a disconnect, WiFi
+ * mode ending — so the phone finds the logger at once, then slow. Units of
+ * 0.625 ms. The fast phase ends by its duration (BLE_GAP_EVENT_ADV_COMPLETE
+ * with BLE_HS_ETIMEOUT), which restarts slow. */
+#define ADV_FAST_ITVL      80      /* 50 ms */
+#define ADV_SLOW_ITVL      1600    /* 1 s */
+#define ADV_FAST_MS        30000   /* 30 s */
+
 static void start_advertising(void)
+{
+    start_advertising_at(true);
+}
+
+static void start_advertising_at(bool fast)
 {
     struct ble_hs_adv_fields fields = {0};
     const char *name = idl0_device_name();
@@ -509,14 +526,16 @@ static void start_advertising(void)
     struct ble_gap_adv_params adv_params = {0};
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;   /* undirected connectable */
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;   /* general discoverable */
+    adv_params.itvl_min  = fast ? ADV_FAST_ITVL : ADV_SLOW_ITVL;
+    adv_params.itvl_max  = fast ? ADV_FAST_ITVL : ADV_SLOW_ITVL;
 
-    rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER,
+    rc = ble_gap_adv_start(s_own_addr_type, NULL, fast ? ADV_FAST_MS : BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_adv_start failed; rc=%d", rc);
         return;
     }
-    ESP_LOGI(TAG, "advertising as %s", name);
+    ESP_LOGI(TAG, "advertising as %s (%s)", name, fast ? "fast" : "slow");
 }
 
 /* Called when the host and controller have synced. */
