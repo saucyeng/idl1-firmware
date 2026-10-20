@@ -24,6 +24,7 @@
 #include "idl1_format.h"
 #include "imu_driver.h"
 #include "imu_driver_i2c.h"
+#include "i2c_bus.h"
 #include "imu_ranges.h"
 #include "mode_state.h"
 #include "pins.h"
@@ -152,6 +153,12 @@ static uint8_t           s_block[IDL1_RECORD_FRAME_BYTES + IDL1_IMU_BLOCK_FIXED_
 static uint32_t s_m_bus_errors[IDL0_IMU_COUNT];   /* IMU lost mid-session */
 static bool     s_reported_lost[IDL0_IMU_COUNT];
 
+/* Serialises IMU re-init between the session-start path (BLE task) and the
+ * retries on the IMU task (idle and mid-session), so one IMU's device
+ * handle is never removed and re-added by two tasks at once. Created in
+ * idl0_imu_task_start(). */
+static SemaphoreHandle_t s_reinit_lock;
+
 /* LOGGER_EVENT rate limiting (F12): occurrences not yet written, and when
  * each code/source last wrote one. A code fires at most once a second per
  * source, carrying the count since its last record; a failed write (the
@@ -185,6 +192,41 @@ static inline bool imu_read_chip_ts(uint8_t i, uint32_t *chip_ts) {
         : idl0_imu_read_chip_ts(i, chip_ts);
 }
 
+static bool reinit_one_if_down(uint8_t i, bool *ok_out);
+
+/* Mid-session recovery (Isaac, 2026-10-19: restarting a pod mid-recording
+ * "better than having it be bricked"). An IMU lost during a session is
+ * retried from this task, so the retry never races its own drain: every
+ * SESSION_REINIT_PERIOD_MS for the first SESSION_REINIT_FAST_TRIES tries,
+ * then every SESSION_REINIT_SLOW_MS. An I2C pod is probed first with a
+ * short timeout, so a pod that is gone costs one ~0.1 ms NACK, not a full
+ * init's worth of timeouts that would starve the other IMUs' FIFOs. */
+#define SESSION_REINIT_PERIOD_MS  1000
+#define SESSION_REINIT_SLOW_MS    5000
+#define SESSION_REINIT_FAST_TRIES 10
+#define SESSION_REINIT_PROBE_MS   5
+static int64_t  s_session_retry_us[IDL0_IMU_COUNT];
+static uint32_t s_session_tries[IDL0_IMU_COUNT];
+
+static void session_reinit(uint8_t i)
+{
+    const int64_t now = esp_timer_get_time();
+    const int64_t period_ms = s_session_tries[i] < SESSION_REINIT_FAST_TRIES
+        ? SESSION_REINIT_PERIOD_MS : SESSION_REINIT_SLOW_MS;
+    if (now - s_session_retry_us[i] < period_ms * 1000) return;
+    s_session_retry_us[i] = now;
+    s_session_tries[i]++;
+    if (s_imu_bus[i] == IDL0_BUS_I2C &&
+        i2c_master_probe(idl1_i2c_bus_get(), s_imu_i2c_addr[i], SESSION_REINIT_PROBE_MS) != ESP_OK) {
+        return;
+    }
+    if (xSemaphoreTake(s_reinit_lock, 0) != pdTRUE) return;
+    bool ok = false;
+    (void)reinit_one_if_down(i, &ok);
+    xSemaphoreGive(s_reinit_lock);
+    if (ok) s_session_tries[i] = 0;
+}
+
 static void drain_one(uint8_t imu_index)
 {
     /* T20: an IMU with no recorded axes has no registry entries; skip it. */
@@ -199,11 +241,23 @@ static void drain_one(uint8_t imu_index)
             s_m_bus_errors[imu_index]++;
             note_event(IDL1_EVT_IMU_LOST, imu_index, 1);
         }
+        if (running && s_reported_lost[imu_index]) session_reinit(imu_index);
         return;
     }
     if (s_reported_lost[imu_index] && running) {
+        /* The re-init restarted the chip's FIFO and TIMESTAMP counter. The
+         * IMU_RECOVERED event tells the parser a new clock segment starts
+         * here (.idl1 spec §4.3), so it is written now, unthrottled, and
+         * before any block from the restarted chip; if the writer is full,
+         * this IMU waits a cycle rather than log blocks the parser would
+         * time on the old clock. */
+        s_evt_pending[IDL1_EVT_IMU_RECOVERED][imu_index] += 1;
+        flush_event(IDL1_EVT_IMU_RECOVERED, imu_index, esp_timer_get_time(), true);
+        if (s_evt_pending[IDL1_EVT_IMU_RECOVERED][imu_index] != 0) {
+            s_evt_pending[IDL1_EVT_IMU_RECOVERED][imu_index] = 0;
+            return;
+        }
         s_reported_lost[imu_index] = false;
-        note_event(IDL1_EVT_IMU_RECOVERED, imu_index, 1);
     }
 
     /* The clock pair (F12): esp_timer, then the chip's TIMESTAMP register
@@ -417,11 +471,6 @@ idl0_imu_state_t idl0_imu_task_state(void)
     return IDL0_IMU_OK;
 }
 
-/* Serialises re-init between the session-start path (BLE task) and the idle
- * retry in imu_task_fn, so one IMU's device handle is never removed and
- * re-added by both at once. Created in idl0_imu_task_start(). */
-static SemaphoreHandle_t s_reinit_lock;
-
 /* Re-run init for IMU `i` if it is configured, was brought up at boot and
  * is latched down now. Returns true if it was retried. Caller holds
  * s_reinit_lock. *ok_out gets the outcome. */
@@ -467,9 +516,8 @@ void idl0_imu_task_reinit_failed(void)
  * and before this only a session start brought it back, so a single I2C
  * hiccup at boot left the front pod reading 0 samples until the next ride.
  * While no session is running the IMU task retries every latched-down IMU
- * once per IDLE_REINIT_PERIOD_MS. Never during a session: a mid-session
- * re-init resets the chip's FIFO and timestamp, which the session's time
- * model does not cover; the session-start re-init still applies. Runs on
+ * once per IDLE_REINIT_PERIOD_MS. During a session session_reinit() does
+ * the retrying instead, and marks the restart with IMU_RECOVERED. Runs on
  * the IMU task itself, so it never races drain_one(). Only an IMU that has
  * been up at least once this boot is retried: an unplugged pod is a normal
  * configuration and is not probed every second. */
