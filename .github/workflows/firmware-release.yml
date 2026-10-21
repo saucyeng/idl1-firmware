@@ -64,6 +64,10 @@ jobs:
           (cd dist && sha256sum "idl1-firmware-${V}.bin" > "idl1-firmware-${V}.bin.sha256")
           echo "bin=dist/idl1-firmware-${V}.bin" >> "$GITHUB_OUTPUT"
           echo "sha=dist/idl1-firmware-${V}.bin.sha256" >> "$GITHUB_OUTPUT"
+          # Symbols for this exact image (JTAG backtraces, panic decoding).
+          # An .elf, never a second .bin, so the asset contract above holds.
+          cp build/idl1_firmware.elf "dist/idl1-firmware-${V}.elf"
+          echo "elf=dist/idl1-firmware-${V}.elf" >> "$GITHUB_OUTPUT"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -74,3 +78,4 @@ jobs:
           files: |
             ${{ steps.assets.outputs.bin }}
             ${{ steps.assets.outputs.sha }}
+            ${{ steps.assets.outputs.elf }}
