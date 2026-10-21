@@ -37,6 +37,10 @@ typedef enum {
      * press — any session is stopped and closed, the rail goes off and the
      * chip deep-sleeps until the button is pressed. Acked before it runs. */
     IDL0_CMD_POWER_OFF         = 0x0B,
+    /* "Still here" (§7.2 link liveness, added 2026-10-21): the app sends it
+     * every 5 s. It arms the connection; an armed connection silent for
+     * 15 s is dropped. Handled in the BLE layer. */
+    IDL0_CMD_KEEPALIVE         = 0x0C,
 } idl0_ble_command_t;
 
 /* Returns the ATT result code that the GATT write response will carry:
@@ -73,6 +77,6 @@ void idl0_ble_resume(void);
 /* True while the §10.4 radio handoff has BLE suspended. */
 bool idl0_ble_is_suspended(void);
 
-/* True while a central (the phone) is connected to the GATT server. The HRM
- * strap link (central role, hrm_task.c) does not count. */
+/* True while at least one phone is connected to the GATT server (up to two,
+ * §7.2). The HRM strap link (central role, hrm_task.c) does not count. */
 bool idl0_ble_is_connected(void);

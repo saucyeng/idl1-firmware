@@ -14,6 +14,7 @@
 
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "freertos/FreeRTOS.h"
@@ -31,6 +32,7 @@
 #include "idl0_config.h"
 #include "session.h"
 #include "session_files.h"
+#include "wifi_server.h"
 
 static const char *TAG = "ble";
 
@@ -72,8 +74,121 @@ static char  *s_cfg_tx_buf;  /* NULL unless a read-back is in flight */
 static size_t s_cfg_tx_len;  /* snapshot length */
 static size_t s_cfg_tx_pos;  /* bytes already served */
 
-/* Current connection, or BLE_HS_CONN_HANDLE_NONE when not connected. */
-static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+/* Phone connections (§7.2 "Two phones", 2026-10-21): up to two at once, so
+ * one stuck link can't lock everyone out. `armed` once the phone has sent
+ * CMD_KEEPALIVE; `last_rx_us` is its last write or read. Changed only on the
+ * NimBLE host task; the liveness timer (esp_timer task) and the status
+ * publisher read it, so every access holds s_conn_mux. */
+#define IDL0_BLE_MAX_PHONES 2
+typedef struct {
+    uint16_t handle;      /* BLE_HS_CONN_HANDLE_NONE when the slot is free */
+    bool     armed;
+    int64_t  last_rx_us;
+} phone_conn_t;
+static phone_conn_t s_conns[IDL0_BLE_MAX_PHONES] = {
+    { .handle = BLE_HS_CONN_HANDLE_NONE },
+    { .handle = BLE_HS_CONN_HANDLE_NONE },
+};
+static portMUX_TYPE s_conn_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* An armed phone silent this long is dropped (§7.2 link liveness): three
+ * missed 5 s keepalives. */
+#define IDL0_BLE_KEEPALIVE_TIMEOUT_US (15 * 1000 * 1000LL)
+
+static esp_timer_handle_t s_liveness_timer;
+
+/* Number of connected phones. */
+static int conn_count(void)
+{
+    int n = 0;
+    portENTER_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < IDL0_BLE_MAX_PHONES; i++) {
+        if (s_conns[i].handle != BLE_HS_CONN_HANDLE_NONE) n++;
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+    return n;
+}
+
+/* Takes a free slot for `handle`; false when both are in use. */
+static bool conn_add(uint16_t handle)
+{
+    bool added = false;
+    portENTER_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < IDL0_BLE_MAX_PHONES && !added; i++) {
+        if (s_conns[i].handle == BLE_HS_CONN_HANDLE_NONE) {
+            s_conns[i] = (phone_conn_t){ .handle = handle, .armed = false, .last_rx_us = esp_timer_get_time() };
+            added = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+    return added;
+}
+
+/* Frees `handle`'s slot, if it has one. */
+static void conn_remove(uint16_t handle)
+{
+    portENTER_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < IDL0_BLE_MAX_PHONES; i++) {
+        if (s_conns[i].handle == handle) s_conns[i].handle = BLE_HS_CONN_HANDLE_NONE;
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+}
+
+/* `handle` just wrote or read something; `keepalive` arms it. */
+static void conn_touch(uint16_t handle, bool keepalive)
+{
+    const int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < IDL0_BLE_MAX_PHONES; i++) {
+        if (s_conns[i].handle == handle) {
+            s_conns[i].last_rx_us = now;
+            if (keepalive) s_conns[i].armed = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+}
+
+/* Copies the connected handles into `out`; returns how many. */
+static int conn_handles(uint16_t out[IDL0_BLE_MAX_PHONES])
+{
+    int n = 0;
+    portENTER_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < IDL0_BLE_MAX_PHONES; i++) {
+        if (s_conns[i].handle != BLE_HS_CONN_HANDLE_NONE) out[n++] = s_conns[i].handle;
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+    return n;
+}
+
+/* 1 Hz (esp_timer task): drops every armed phone silent past the timeout.
+ * While WiFi mode is on every phone counts as alive — the app has lent its
+ * link to the transfer and sends no keepalives (§7.2). */
+static void liveness_tick(void *arg)
+{
+    (void)arg;
+    const int64_t now = esp_timer_get_time();
+    const bool wifi = idl0_wifi_state() != IDL0_WIFI_OFF;
+    uint16_t dead[IDL0_BLE_MAX_PHONES];
+    int n = 0;
+    portENTER_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < IDL0_BLE_MAX_PHONES; i++) {
+        phone_conn_t *c = &s_conns[i];
+        if (c->handle == BLE_HS_CONN_HANDLE_NONE) continue;
+        if (wifi) {
+            c->last_rx_us = now;
+        } else if (c->armed && now - c->last_rx_us > IDL0_BLE_KEEPALIVE_TIMEOUT_US) {
+            dead[n++] = c->handle;
+            c->armed = false;   /* one terminate per silence, not one a second */
+        }
+    }
+    portEXIT_CRITICAL(&s_conn_mux);
+    for (int i = 0; i < n; i++) {
+        ESP_LOGW(TAG, "phone on handle %u silent %lld s: dropping it (link liveness, \302\2477.2)",
+                 (unsigned)dead[i], (long long)(IDL0_BLE_KEEPALIVE_TIMEOUT_US / 1000000));
+        idl0_diag_log_event("ble keepalive timeout");
+        ble_gap_terminate(dead[i], BLE_ERR_REM_USER_CONN_TERM);
+    }
+}
 
 /* Value handle of the status characteristic, filled in by the stack at
  * registration; needed to send notifications. */
@@ -184,9 +299,9 @@ static uint8_t config_commit(void)
 static int config_rx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn_handle;
     (void)attr_handle;
     (void)arg;
+    conn_touch(conn_handle, false);
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_UNLIKELY;
     }
@@ -287,9 +402,9 @@ static uint8_t files_read_begin(void)
 static int config_tx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn_handle;
     (void)attr_handle;
     (void)arg;
+    conn_touch(conn_handle, false);
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
         return BLE_ATT_ERR_UNLIKELY;
     }
@@ -314,6 +429,7 @@ static int config_tx_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    conn_touch(conn_handle, false);
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_UNLIKELY;
     }
@@ -329,9 +445,15 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    if (cmd < IDL0_CMD_WIFI_ON || cmd > IDL0_CMD_POWER_OFF) {
+    if (cmd < IDL0_CMD_WIFI_ON || cmd > IDL0_CMD_KEEPALIVE) {
         ESP_LOGW(TAG, "unknown control command 0x%02X", cmd);
         return BLE_ATT_ERR_INVALID_PDU;
+    }
+
+    /* Every 5 s from each phone: arm and ack, no log line (§7.2). */
+    if (cmd == IDL0_CMD_KEEPALIVE) {
+        conn_touch(conn_handle, true);
+        return IDL0_ACK_OK;
     }
 
     ESP_LOGI(TAG, "control command 0x%02X", cmd);
@@ -378,6 +500,7 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 static int status_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                             struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
+    conn_touch(conn_handle, false);
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) {
         return BLE_ATT_ERR_UNLIKELY;
     }
@@ -442,8 +565,16 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
                      * handle. */
                     ble_gap_terminate(event->connect.conn_handle,
                                       BLE_ERR_REM_USER_CONN_TERM);
+                } else if (!conn_add(event->connect.conn_handle)) {
+                    /* Both phone slots taken (a third central got in while
+                     * the HRM slot was free): refuse it. */
+                    ESP_LOGW(TAG, "third phone refused: two already connected");
+                    ble_gap_terminate(event->connect.conn_handle, BLE_ERR_CONN_LIMIT);
                 } else {
-                    s_conn_handle = event->connect.conn_handle;
+                    /* A second phone can still find the logger (§7.2). */
+                    if (conn_count() < IDL0_BLE_MAX_PHONES) {
+                        start_advertising_at(false);
+                    }
                     /* T14: a status Handle Value Notification is a single
                      * ATT PDU capped at MTU-3; without an MTU exchange the
                      * link stays at the 23-byte default and every notify is
@@ -463,21 +594,26 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 
         case BLE_GAP_EVENT_DISCONNECT:
             ESP_LOGI(TAG, "disconnect; reason=%d", event->disconnect.reason);
-            s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            conn_remove(event->disconnect.conn.conn_handle);
             /* Drop any half-streamed config blob / read-back snapshot so they
              * can't leak across the disconnect or be committed after a
-             * reconnect. */
+             * reconnect. Single buffers: either phone's disconnect drops
+             * them (§7.2). */
             config_buf_reset();
             config_tx_reset();
-            if (!s_suspended) {
+            if (!s_suspended && conn_count() < IDL0_BLE_MAX_PHONES) {
+                /* Fast again, replacing the slow advertising a remaining
+                 * phone left running. (Still full after this disconnect
+                 * means it was a refused third central: stay quiet.) */
+                ble_gap_adv_stop();
                 start_advertising();
             }
             break;
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
-            if (!s_suspended) {
+            if (!s_suspended && conn_count() < IDL0_BLE_MAX_PHONES) {
                 /* The fast phase timed out, or a phone connected: carry on
-                 * slowly (a second phone can still find it). */
+                 * slowly while a phone slot is free (§7.2). */
                 ESP_LOGI(TAG, "advertising complete (reason %d); slow", event->adv_complete.reason);
                 start_advertising_at(false);
             }
@@ -531,6 +667,9 @@ static void start_advertising_at(bool fast)
 
     rc = ble_gap_adv_start(s_own_addr_type, NULL, fast ? ADV_FAST_MS : BLE_HS_FOREVER,
                            &adv_params, gap_event_cb, NULL);
+    if (rc == BLE_HS_EALREADY) {
+        return;   /* already advertising: a connect and its ADV_COMPLETE both asked */
+    }
     if (rc != 0) {
         ESP_LOGE(TAG, "ble_gap_adv_start failed; rc=%d", rc);
         return;
@@ -618,6 +757,14 @@ bool idl0_ble_init(idl0_ble_command_cb on_command)
         return false;
     }
 
+    /* Link liveness (§7.2): a 1 Hz check for silent armed phones. A failure
+     * here only loses the check, never the control plane. */
+    const esp_timer_create_args_t liveness = { .callback = liveness_tick, .name = "ble_live" };
+    if (esp_timer_create(&liveness, &s_liveness_timer) != ESP_OK ||
+        esp_timer_start_periodic(s_liveness_timer, 1000 * 1000) != ESP_OK) {
+        ESP_LOGE(TAG, "link liveness timer failed to start; dead links won't be dropped");
+    }
+
     nimble_port_freertos_init(ble_host_task);
     ESP_LOGI(TAG, "NimBLE host started");
     return true;
@@ -646,18 +793,20 @@ void idl0_ble_publish_status(const char *status_string)
     memcpy(status_copy, s_status, sizeof(status_copy));
     portEXIT_CRITICAL(&s_status_mux);
 
-    /* Notify the connected central, if any. */
-    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
-        return;
-    }
-    struct os_mbuf *om = ble_hs_mbuf_from_flat(status_copy, strlen(status_copy));
-    if (om == NULL) {
-        ESP_LOGE(TAG, "status notify: mbuf alloc failed");
-        return;
-    }
-    int rc = ble_gatts_notify_custom(s_conn_handle, s_status_val_handle, om);
-    if (rc != 0) {
-        ESP_LOGW(TAG, "status notify failed; rc=%d", rc);
+    /* Notify every connected phone (§7.2: up to two). Each notify consumes
+     * its own mbuf. */
+    uint16_t handles[IDL0_BLE_MAX_PHONES];
+    const int n = conn_handles(handles);
+    for (int i = 0; i < n; i++) {
+        struct os_mbuf *om = ble_hs_mbuf_from_flat(status_copy, strlen(status_copy));
+        if (om == NULL) {
+            ESP_LOGE(TAG, "status notify: mbuf alloc failed");
+            return;
+        }
+        int rc = ble_gatts_notify_custom(handles[i], s_status_val_handle, om);
+        if (rc != 0) {
+            ESP_LOGW(TAG, "status notify failed; rc=%d", rc);
+        }
     }
 }
 
@@ -671,8 +820,10 @@ void idl0_ble_suspend(void)
      * cannot race a new inbound connection. Both calls are safe from
      * non-host tasks (NimBLE serializes via the host lock). */
     ble_gap_adv_stop();
-    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
-        ble_gap_terminate(s_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    uint16_t handles[IDL0_BLE_MAX_PHONES];
+    const int n = conn_handles(handles);
+    for (int i = 0; i < n; i++) {
+        ble_gap_terminate(handles[i], BLE_ERR_REM_USER_CONN_TERM);
     }
     /* \302\247 is UTF-8 "§" in octal escapes — hex escapes are greedy in C
      * ("\xA710" would parse as one escape), octal stops at three digits. */
@@ -698,7 +849,5 @@ bool idl0_ble_is_suspended(void)
 
 bool idl0_ble_is_connected(void)
 {
-    /* u16 load of a NimBLE-host-task-owned value; single-core C6, cannot
-     * tear. Indication only (board LEDs). */
-    return s_conn_handle != BLE_HS_CONN_HANDLE_NONE;
+    return conn_count() > 0;
 }

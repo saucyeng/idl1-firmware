@@ -24,10 +24,10 @@ CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 
 # Dual-role NimBLE: peripheral (GATT server for the phone) + central
-# (GATT client for the BLE Heart Rate Monitor — §7.5). Two simultaneous
-# connections: phone + HRM strap. See §10.4 for coexistence.
+# (GATT client for the BLE Heart Rate Monitor — §7.5). Three simultaneous
+# connections: two phones (§7.2, 2026-10-21) + HRM strap. See §10.4 for coexistence.
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
-CONFIG_BT_NIMBLE_MAX_CONNECTIONS=2
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
 
 # Preferred ATT MTU 512 so the multi-line status string (§7.3, ~330 bytes
 # with every line present) fits in a single notification once the app
