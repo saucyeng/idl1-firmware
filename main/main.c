@@ -99,9 +99,11 @@ static uint8_t on_ble_command(idl0_ble_command_t cmd)
         case IDL0_CMD_CONFIG_COMMIT:
         case IDL0_CMD_CONFIG_READ_BEGIN:
         case IDL0_CMD_FILES_READ_BEGIN:
-            /* Config push/read handshakes are handled entirely in the BLE
-             * layer (it owns the FF05/FF06 buffers) and never routed here.
-             * Defensive: if one ever reaches the dispatcher, refuse cleanly. */
+        case IDL0_CMD_KEEPALIVE:
+            /* Config push/read handshakes and the keepalive are handled
+             * entirely in the BLE layer (it owns the FF05/FF06 buffers and
+             * the link-liveness state) and never routed here. Defensive: if
+             * one ever reaches the dispatcher, refuse cleanly. */
             ESP_LOGW(TAG, "config command 0x%02X reached dispatcher", cmd);
             ack = IDL0_ACK_NOT_IMPLEMENTED;
             break;
