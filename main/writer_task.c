@@ -24,6 +24,22 @@ static TaskHandle_t    s_task = NULL;
  * never overlaps a release (WiFi mode). */
 static SemaphoreHandle_t s_rb_lock = NULL;
 
+/* Tasks waiting in release/restore for s_rb_lock. The writer (priority 5)
+ * gives the lock and takes it straight back, and a FreeRTOS mutex is not
+ * handed to a waiter on give, so a lower-priority waiter never got it: the
+ * button task (priority 4) hung in idl0_writer_restore() at session start
+ * for good (2026-10-21, JTAG backtrace). While this is non-zero the writer
+ * sleeps one tick after each give to let the waiter in. Zero all through a
+ * session, so the logging path is unchanged. */
+static volatile uint32_t s_rb_waiters;
+
+static void rb_lock_take_waiting(void)
+{
+    __atomic_add_fetch(&s_rb_waiters, 1, __ATOMIC_SEQ_CST);
+    xSemaphoreTake(s_rb_lock, portMAX_DELAY);
+    __atomic_sub_fetch(&s_rb_waiters, 1, __ATOMIC_SEQ_CST);
+}
+
 /* T05 diag: idl0_sd_append failures, counted not logged per-item — the writer
  * is the sole consumer draining at producer batch rate (~20 ms); a per-item
  * ESP_LOGW would throttle the pipeline during the very failure it reports.
@@ -81,6 +97,9 @@ static void writer_task_fn(void *arg)
             vRingbufferReturnItem(rb, item);
         }
         xSemaphoreGive(s_rb_lock);
+        if (s_rb_waiters != 0) {
+            vTaskDelay(1);   /* let a lower-priority release/restore take it */
+        }
         /* Periodic durability flush + fsync. idl0_sd_append fills a 16 KB
          * cluster buffer without flushing (so it doesn't hold the shared SPI
          * bus on every batch); idl0_sd_flush pushes that buffer through AND
@@ -125,7 +144,7 @@ void idl0_writer_release(void)
     if (s_rb_lock == NULL) {
         return;
     }
-    xSemaphoreTake(s_rb_lock, portMAX_DELAY);
+    rb_lock_take_waiting();
     if (s_rb != NULL) {
         RingbufHandle_t rb = s_rb;
         s_rb = NULL;
@@ -140,7 +159,7 @@ bool idl0_writer_restore(void)
     if (s_rb_lock == NULL) {
         return false;
     }
-    xSemaphoreTake(s_rb_lock, portMAX_DELAY);
+    rb_lock_take_waiting();
     if (s_rb == NULL) {
         s_rb = xRingbufferCreate(IDL0_WRITER_BUFFER_BYTES, RINGBUF_TYPE_NOSPLIT);
         if (s_rb == NULL) {
