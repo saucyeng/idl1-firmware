@@ -270,10 +270,17 @@ bool imu_chip_read_timestamp(stmdev_ctx_t *ctx, imu_chip_instance_t *inst,
                              uint32_t *chip_ts)
 {
     if (inst->per_state != IDL0_IMU_OK) return false;
-    if (lsm6dsv320x_timestamp_raw_get(ctx, chip_ts) != 0) {
+    /* Not lsm6dsv320x_timestamp_raw_get(): the vendored v5.4.0 shifts once
+     * more after OR-ing in TIMESTAMP0, returning (ts << 8) with the top
+     * byte lost. Every block's read_chip_ts was off by that shift, which the
+     * importer unwrapped as a 2^32-tick wrap per block (2026-11-02). */
+    uint8_t b[4];
+    if (lsm6dsv320x_read_reg(ctx, LSM6DSV320X_TIMESTAMP0, b, 4) != 0) {
         inst->per_state = IDL0_IMU_ERROR;
         return false;
     }
+    *chip_ts = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+               ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);  /* ticks, LE */
     return true;
 }
 
