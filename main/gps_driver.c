@@ -315,6 +315,13 @@ bool idl0_gps_live(uint8_t *fix_quality, uint8_t *satellites)
  * the next command" (ID §4.9.21). */
 #define IDL0_GPS_SIGNAL_SETTLE_MS  500  /* ms */
 
+/* The module powers up on the PWR_EN rail early in app_main, a few hundred
+ * ms before init runs, and ignores UBX for a while after: on hardware, MON-VER
+ * polls in the first ~2 s after power-on went unanswered every boot (though
+ * it was already sending NMEA), and one at ~4 s was answered. Init keeps
+ * polling at the factory rate until this long has passed. */
+#define IDL0_GPS_STARTUP_WAIT_MS  5000  /* ms, from init */
+
 
 static const char *TAG = "gps";
 
@@ -429,12 +436,24 @@ static bool ubx_switch_baud(void)
 /* Applies the §8 `gps` settings (RAM layer). Runs once at boot with the UART
  * to itself, before the GPS task reads it. A failure leaves the module on
  * whatever it was running — still NMEA at ≥1 Hz — and is reported. */
+/* Polls MON-VER at the factory rate until the module answers or
+ * IDL0_GPS_STARTUP_WAIT_MS has passed. */
+static bool ubx_probe_startup(void)
+{
+    const int64_t deadline = esp_timer_get_time() + (int64_t)IDL0_GPS_STARTUP_WAIT_MS * 1000;
+    do {
+        if (ubx_probe()) return true;
+    } while (esp_timer_get_time() < deadline);
+    return false;
+}
+
 static idl0_gps_cfg_result_t gps_configure(const idl0_gps_settings_t *cfg)
 {
-    /* Find the module: factory rate first (cold power-up), then the run
-     * rate (an ESP reset with the module still powered). */
+    /* Find the module: factory rate first (cold power-up, waiting out its
+     * start), then the run rate (an ESP reset with the module still
+     * powered). */
     bool at_run_baud = false;
-    if (!ubx_probe()) {
+    if (!ubx_probe_startup()) {
         uart_set_baudrate(IDL0_GPS_UART, IDL0_GPS_BAUD_RUN);
         if (!ubx_probe()) {
             uart_set_baudrate(IDL0_GPS_UART, IDL0_GPS_BAUD_FACTORY);

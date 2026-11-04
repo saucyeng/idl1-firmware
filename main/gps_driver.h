@@ -101,7 +101,7 @@ typedef enum {
 } idl0_gps_state_t;
 
 /* Opens the UART and configures the module with `settings` (blocks up to
- * ~5 s when the module does not answer). Returns false only when the UART
+ * ~6 s when the module does not answer). Returns false only when the UART
  * itself fails; a configuration failure is reported by
  * idl0_gps_config_result. */
 bool idl0_gps_init(const idl0_gps_settings_t *settings);

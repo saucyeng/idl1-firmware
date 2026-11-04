@@ -109,7 +109,9 @@ size_t ubx_valset_frame(const ubx_valset_t *v, uint8_t *out, size_t cap);
 /* Byte-at-a-time frame parser. Bytes outside a UBX frame (NMEA text) are
  * skipped. A frame whose payload is longer than UBX_PARSER_MAX_PAYLOAD is
  * dropped, as is one with a bad checksum. */
-#define UBX_PARSER_MAX_PAYLOAD 256  /* bytes; MON-VER is 40 + n·30 */
+/* bytes; MON-VER is 40 + n·30. 256 (n ≤ 7) dropped the SAM-M10Q's reply
+ * on hardware; 512 holds n ≤ 15. */
+#define UBX_PARSER_MAX_PAYLOAD 512
 
 typedef struct {
     uint8_t  state;
