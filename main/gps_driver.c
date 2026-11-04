@@ -16,7 +16,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "idl0_config.h"  /* IDL0_GPS_NMEA_* bits */
 #include "pins.h"
 #include "ubx.h"
 
@@ -117,7 +116,7 @@ idl0_nmea_rmc_result_t idl0_nmea_parse_rmc(const char *line, idl0_gps_fix_t *fix
     /* Talker prefix may be GP, GN, GL, GA — match on the message id only. */
     if (strlen(line) < 6 || strncmp(line + 3, "RMC", 3) != 0) return IDL0_NMEA_RMC_INVALID;
 
-    char buf[96];
+    char buf[IDL0_NMEA_LINE_MAX];
     strncpy(buf, line, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     char *t[16] = {0};
@@ -199,7 +198,7 @@ bool idl0_nmea_parse_gga(const char *line, idl0_gps_fix_t *fix)
     if (!idl0_nmea_verify_checksum(line)) return false;
     if (strlen(line) < 6 || strncmp(line + 3, "GGA", 3) != 0) return false;
 
-    char buf[96];
+    char buf[IDL0_NMEA_LINE_MAX];
     strncpy(buf, line, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
     char *t[16] = {0};
@@ -316,19 +315,18 @@ bool idl0_gps_live(uint8_t *fix_quality, uint8_t *satellites)
  * the next command" (ID §4.9.21). */
 #define IDL0_GPS_SIGNAL_SETTLE_MS  500  /* ms */
 
-/* Highest navigation rate the data sheet gives for the factory signal set
- * (GPS + Galileo + BeiDou B1C + GLONASS, data sheet Table 1, "Default"
- * column, ≥98% fix rate). Above it the module still accepts the rate but
- * may drop solutions. */
-#define IDL0_GPS_MAX_RATE_FACTORY_SIGNALS_HZ  4  /* Hz */
 
 static const char *TAG = "gps";
 
 static idl0_gps_cfg_result_t s_cfg_result = IDL0_GPS_CFG_NOT_RUN;
 static uint8_t s_applied_rate_hz = 1;  /* Hz; factory default until a VALSET is acked */
+static idl0_gps_settings_t s_settings;  /* what idl0_gps_init was given */
+static char s_module_sw[31];            /* MON-VER swVersion, CH[30] + NUL */
 
 idl0_gps_cfg_result_t idl0_gps_config_result(void) { return s_cfg_result; }
 uint8_t idl0_gps_applied_rate_hz(void) { return s_applied_rate_hz; }
+const idl0_gps_settings_t *idl0_gps_settings(void) { return &s_settings; }
+const char *idl0_gps_module_version(void) { return s_module_sw; }
 
 const char *idl0_gps_cfg_result_str(idl0_gps_cfg_result_t r)
 {
@@ -377,10 +375,10 @@ static bool ubx_probe(void)
         p.len < 40) {
         return false;
     }
-    char sw[31], hw[11];
-    memcpy(sw, p.payload, 30);      sw[30] = '\0';  /* CH[30] swVersion */
-    memcpy(hw, p.payload + 30, 10); hw[10] = '\0';  /* CH[10] hwVersion */
-    ESP_LOGI(TAG, "module: sw \"%s\" hw \"%s\"", sw, hw);
+    char hw[11];
+    memcpy(s_module_sw, p.payload, 30); s_module_sw[30] = '\0';  /* CH[30] swVersion */
+    memcpy(hw, p.payload + 30, 10);     hw[10] = '\0';           /* CH[10] hwVersion */
+    ESP_LOGI(TAG, "module: sw \"%s\" hw \"%s\"", s_module_sw, hw);
     return true;
 }
 
@@ -452,10 +450,11 @@ static idl0_gps_cfg_result_t gps_configure(const idl0_gps_settings_t *cfg)
                  IDL0_GPS_BAUD_RUN, IDL0_GPS_BAUD_FACTORY);
     }
 
-    const uint8_t rate_hz = (cfg->rate_hz < 1) ? 1 : (cfg->rate_hz > 10 ? 10 : cfg->rate_hz);
+    const uint8_t rate_hz = (cfg->rate_hz < 1) ? 1 : (cfg->rate_hz > 18 ? 18 : cfg->rate_hz);
     ubx_valset_t v;
     ubx_valset_init(&v, UBX_LAYER_RAM);
-    ubx_valset_add(&v, UBX_CFG_RATE_MEAS, (uint64_t)(1000 / rate_hz));  /* ms */
+    /* round(1000 / rate) ms: 3 Hz -> 333 ms, 18 Hz -> 56 ms (min 25). */
+    ubx_valset_add(&v, UBX_CFG_RATE_MEAS, (uint64_t)((1000 + rate_hz / 2) / rate_hz));
     ubx_valset_add(&v, UBX_CFG_RATE_NAV, 1);  /* one solution per measurement */
     ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_RMC_UART1, 1);
     ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_GGA_UART1, 1);
@@ -464,20 +463,30 @@ static idl0_gps_cfg_result_t gps_configure(const idl0_gps_settings_t *cfg)
     ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_GSV_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_GSV) ? 1 : 0);
     ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_VTG_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_VTG) ? 1 : 0);
     ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_ZDA_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_ZDA) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_NMEA_HIGHPREC, cfg->high_precision_nmea ? 1 : 0);
     ubx_valset_add(&v, UBX_CFG_NAVSPG_DYNMODEL, cfg->dynamic_model);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_INFIL_MINELEV, (uint8_t)cfg->min_elevation_deg);  /* I1 */
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_INFIL_MINCNO, cfg->min_cno_dbhz);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_INFIL_MINSVS, cfg->min_satellites);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_INFIL_MAXSVS, cfg->max_satellites);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_INFIL_NCNOTHRS, cfg->fix_gate_satellites);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_INFIL_CNOTHRS, cfg->fix_gate_cno_dbhz);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_OUTFIL_PDOP, cfg->pdop_mask_x10);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_OUTFIL_PACC, cfg->position_accuracy_mask_m);
     idl0_gps_cfg_result_t r = ubx_valset_send(&v);
     if (r != IDL0_GPS_CFG_OK) return r;
     s_applied_rate_hz = rate_hz;
-    if (rate_hz > IDL0_GPS_MAX_RATE_FACTORY_SIGNALS_HZ) {
-        ESP_LOGW(TAG, "%u Hz is above the %d Hz the data sheet gives for four "
-                      "constellations — solutions may be dropped",
-                 (unsigned)rate_hz, IDL0_GPS_MAX_RATE_FACTORY_SIGNALS_HZ);
-    }
 
-    /* SBAS on its own: a CFG-SIGNAL change restarts the GNSS subsystem.
-     * Sent every boot, since the module may hold a previous boot's value. */
+    /* Signals in a VALSET of their own: any CFG-SIGNAL change restarts the
+     * GNSS subsystem. Sent every boot, since the module may hold a previous
+     * boot's set. */
     ubx_valset_init(&v, UBX_LAYER_RAM);
-    ubx_valset_add(&v, UBX_CFG_SIGNAL_SBAS_ENA, cfg->sbas_enabled ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_GPS_ENA,  (cfg->signals & IDL0_GPS_SIG_GPS)     ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_GAL_ENA,  (cfg->signals & IDL0_GPS_SIG_GALILEO) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_BDS_ENA,  (cfg->signals & IDL0_GPS_SIG_BEIDOU)  ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_GLO_ENA,  (cfg->signals & IDL0_GPS_SIG_GLONASS) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_QZSS_ENA, (cfg->signals & IDL0_GPS_SIG_QZSS)    ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_SBAS_ENA, (cfg->signals & IDL0_GPS_SIG_SBAS)    ? 1 : 0);
     r = ubx_valset_send(&v);
     vTaskDelay(pdMS_TO_TICKS(IDL0_GPS_SIGNAL_SETTLE_MS));
     return r;
@@ -523,11 +532,12 @@ bool idl0_gps_init(const idl0_gps_settings_t *settings)
 
     /* A configuration failure is reported, not fatal: the module still
      * streams NMEA at whatever it was last set to. */
+    s_settings = *settings;
     s_cfg_result = gps_configure(settings);
     if (s_cfg_result == IDL0_GPS_CFG_OK) {
-        ESP_LOGI(TAG, "GPS configured: %u Hz, dynamic model %u, SBAS %s, extra NMEA 0x%02x",
-                 (unsigned)s_applied_rate_hz, (unsigned)settings->dynamic_model,
-                 settings->sbas_enabled ? "on" : "off", (unsigned)settings->nmea_extra);
+        ESP_LOGI(TAG, "GPS configured: %u Hz, signals 0x%02x, dynamic model %u, extra NMEA 0x%02x",
+                 (unsigned)s_applied_rate_hz, (unsigned)settings->signals,
+                 (unsigned)settings->dynamic_model, (unsigned)settings->nmea_extra);
     } else {
         ESP_LOGE(TAG, "GPS configuration failed (%s) — module left at its current settings",
                  idl0_gps_cfg_result_str(s_cfg_result));

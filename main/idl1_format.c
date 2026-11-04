@@ -185,6 +185,34 @@ size_t idl1_format_logger_event(uint8_t *out_buf, uint8_t code,
     return pos;
 }
 
+size_t idl1_format_gps_config(uint8_t *out_buf, uint8_t result,
+                              uint8_t applied_rate_hz,
+                              const idl0_gps_settings_t *settings,
+                              const char *module_version)
+{
+    size_t pos = 0;
+    put_frame(out_buf, &pos, IDL1_REC_GPS_CONFIG, IDL1_GPS_CONFIG_PAYLOAD);
+    put_u8(out_buf, &pos, IDL1_GPS_CONFIG_VERSION);
+    put_u8(out_buf, &pos, result);
+    put_u8(out_buf, &pos, settings->rate_hz);
+    put_u8(out_buf, &pos, applied_rate_hz);
+    put_u8(out_buf, &pos, settings->signals);
+    put_u8(out_buf, &pos, settings->dynamic_model);
+    put_u8(out_buf, &pos, (uint8_t)settings->min_elevation_deg);  /* i8 */
+    put_u8(out_buf, &pos, settings->min_cno_dbhz);
+    put_u8(out_buf, &pos, settings->min_satellites);
+    put_u8(out_buf, &pos, settings->max_satellites);
+    put_u8(out_buf, &pos, settings->fix_gate_satellites);
+    put_u8(out_buf, &pos, settings->fix_gate_cno_dbhz);
+    put_u16(out_buf, &pos, settings->pdop_mask_x10);
+    put_u16(out_buf, &pos, settings->position_accuracy_mask_m);
+    put_u8(out_buf, &pos, settings->high_precision_nmea ? 1 : 0);  /* nmea_flags bit 0 */
+    put_u8(out_buf, &pos, settings->nmea_extra);
+    put_str(out_buf, &pos, module_version != NULL ? module_version : "",
+            IDL1_GPS_MODULE_VERSION_BYTES);
+    return pos;
+}
+
 size_t idl1_format_session_summary(uint8_t *out_buf, size_t out_len,
                                    uint8_t n_imu,
                                    const uint32_t *overruns,

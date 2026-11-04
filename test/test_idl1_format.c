@@ -122,6 +122,24 @@ static int test_small_records(void)
     CHECK(s == 3 + 1 + 36 + 8);
     CHECK(buf[3] == 3 && rd_u32(buf + 4 + 12) == 2 && rd_u32(buf + 4 + 36) == 5);
 
+    const idl0_gps_settings_t gs = {
+        .rate_hz = 8, .signals = IDL0_GPS_SIG_GPS | IDL0_GPS_SIG_GALILEO | IDL0_GPS_SIG_BEIDOU,
+        .dynamic_model = 4, .min_elevation_deg = 10, .min_cno_dbhz = 6,
+        .min_satellites = 3, .max_satellites = 32, .fix_gate_satellites = 0,
+        .fix_gate_cno_dbhz = 0, .pdop_mask_x10 = 250, .position_accuracy_mask_m = 100,
+        .high_precision_nmea = true, .nmea_extra = IDL0_GPS_NMEA_GSV,
+    };
+    size_t gc = idl1_format_gps_config(buf, 1, 8, &gs, "ROM SPG 5.10 (7b202e)");
+    CHECK(gc == 3 + IDL1_GPS_CONFIG_PAYLOAD && IDL1_GPS_CONFIG_PAYLOAD == 48);
+    CHECK(buf[0] == IDL1_REC_GPS_CONFIG && rd_u16(buf + 1) == 48);
+    CHECK(buf[3] == 1 && buf[4] == 1 && buf[5] == 8 && buf[6] == 8);   /* version, result, rates */
+    CHECK(buf[7] == 0x07 && buf[8] == 4 && buf[9] == 10);              /* signals, model, elevation */
+    CHECK(rd_u16(buf + 15) == 250 && rd_u16(buf + 17) == 100);         /* PDOP x10, accuracy */
+    CHECK(buf[19] == 1 && buf[20] == IDL0_GPS_NMEA_GSV);               /* high precision, extras */
+    CHECK(memcmp(buf + 21, "ROM SPG 5.10 (7b202e)", 21) == 0 && buf[21 + 21] == 0);
+    CHECK(buf[21 + 29] == 0);                                          /* NUL-padded to 30 */
+    CHECK(idl1_format_gps_config(buf, 2, 1, &gs, NULL) == 51 && buf[21] == 0);
+
     CHECK(idl1_format_session_end(buf) == 3 && buf[0] == IDL1_REC_SESSION_END && rd_u16(buf + 1) == 0);
     return 0;
 }

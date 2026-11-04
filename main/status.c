@@ -25,11 +25,12 @@ static esp_timer_handle_t s_publish_timer = NULL;
 
 /* Sized for the full §7.3 line set with every variable-length token at its
  * max: WiFi, Logging, LoggingElapsed (10 digits), BatteryRaw + BatteryMv,
- * SD, SDFreeMiB (10 digits), GPS, GPSFix, GPSSats, IMU, IMU0-IMU2, Firmware
- * (31), OTA, HR, HR_Battery: about 330 bytes. 384 leaves headroom; the
+ * SD, SDFreeMiB (10 digits), GPS, GPSFix, GPSSats, GPSConfig (11), GPSRate,
+ * IMU, IMU0-IMU2, Firmware (31), OTA, HR, HR_Battery: about 365 bytes. 448
+ * leaves headroom; the
  * preferred ATT MTU is 512 (sdkconfig.defaults) so one notification carries
  * it. Keep in lockstep with s_status in ble_service.c. */
-#define IDL0_STATUS_BUF_BYTES 384
+#define IDL0_STATUS_BUF_BYTES 448
 
 /* §7.3 per-IMU token for IMU `index`: OFF not configured, ABSENT no answer
  * on the bus, OK delivering data, ERROR answered but not delivering. */
@@ -112,6 +113,15 @@ void idl0_status_publish(void)
     if (cursor < sizeof(status) && idl0_gps_live(&gps_fix, &gps_sats)) {
         int add = snprintf(status + cursor, sizeof(status) - cursor,
                            "\nGPSFix: %u\nGPSSats: %u", (unsigned)gps_fix, (unsigned)gps_sats);
+        if (add > 0) cursor += (size_t)add;
+    }
+    /* §7.3 GPSConfig / GPSRate (IDL1): the boot-time UBX setup result and
+     * the rate the module acknowledged. Same presence rule as GPSFix. */
+    if (cursor < sizeof(status) && idl0_gps_state() != IDL0_GPS_ABSENT) {
+        int add = snprintf(status + cursor, sizeof(status) - cursor,
+                           "\nGPSConfig: %s\nGPSRate: %u",
+                           idl0_gps_cfg_result_str(idl0_gps_config_result()),
+                           (unsigned)idl0_gps_applied_rate_hz());
         if (add > 0) cursor += (size_t)add;
     }
     if (cursor < sizeof(status)) {

@@ -329,6 +329,21 @@ bool idl0_session_start(void)
         return false;
     }
 
+    /* GPS_CONFIG (spec §4.3): the GPS settings this session records with
+     * and whether the module took them, before any data record. Fixed for
+     * the session — they change only at boot. A failed submit only loses
+     * this record, so it does not stop the start. */
+    if (idl0_gps_state() != IDL0_GPS_ABSENT) {
+        uint8_t gps_cfg[IDL1_RECORD_FRAME_BYTES + IDL1_GPS_CONFIG_PAYLOAD];
+        const size_t gn = idl1_format_gps_config(gps_cfg, (uint8_t)idl0_gps_config_result(),
+                                                 idl0_gps_applied_rate_hz(),
+                                                 idl0_gps_settings(),
+                                                 idl0_gps_module_version());
+        if (!idl0_writer_submit(gps_cfg, gn)) {
+            ESP_LOGW(TAG, "start: GPS_CONFIG write failed");
+        }
+    }
+
     /* Fault flag + per-session diag counters must all be clear BEFORE the
      * session becomes visible (s_running=true) to the 1 Hz fault tick
      * (status.c publish_timer_cb, esp_timer task). That tick checks

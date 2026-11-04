@@ -82,9 +82,21 @@ static void fill_defaults(idl0_config_t *cfg)
     cfg->imu_enabled[0] = cfg->imu_enabled[1] = cfg->imu_enabled[2] = true;
     cfg->hg_sample_rate_hz    = IDL1_IMU_DEFAULT_HG_ODR_HZ;
     cfg->hg_range_g           = IDL1_IMU_DEFAULT_HG_RANGE_G;
-    cfg->gps_sample_rate_hz   = 5;
-    cfg->sbas_enabled         = true;
-    cfg->gps_dynamic_model    = UBX_DYNMODEL_PORTABLE;
+    /* GPS: the SAM-M10Q's factory values (spec §8 "SAM-M10Q (IDL1)"),
+     * except the rate. */
+    cfg->gps.rate_hz                  = 5;
+    cfg->gps.signals                  = IDL0_GPS_SIG_MAJOR | IDL0_GPS_SIG_QZSS | IDL0_GPS_SIG_SBAS;
+    cfg->gps.dynamic_model            = UBX_DYNMODEL_PORTABLE;
+    cfg->gps.min_elevation_deg        = 5;
+    cfg->gps.min_cno_dbhz             = 6;
+    cfg->gps.min_satellites           = 3;
+    cfg->gps.max_satellites           = 32;
+    cfg->gps.fix_gate_satellites      = 0;
+    cfg->gps.fix_gate_cno_dbhz        = 0;
+    cfg->gps.pdop_mask_x10            = 250;
+    cfg->gps.position_accuracy_mask_m = 100;
+    cfg->gps.high_precision_nmea      = false;
+    cfg->gps.nmea_extra               = 0;
     cfg->imu_channel_mask     = DEFAULT_IMU_MASK;
     cfg->config_crc32         = 0;
     /* HRM disabled by default; channel IDs match spec §5.2 so status.c
@@ -241,56 +253,148 @@ static void load_wheel_speed(const cJSON *root, idl0_config_t *cfg)
     }
 }
 
-/* §8 `gps`. dynamic_model takes the spec's five names; "airborne" is the
- * <1 g model, the gentlest of the three. An unknown name or sentence is
- * logged and skipped, keeping the default. */
+/* One §8 `gps` integer field: kept when it is an integer in [lo, hi],
+ * otherwise rejected and logged, leaving the default (spec §8 "SAM-M10Q
+ * (IDL1)": never remapped). Returns true when `*out` was set. */
+static bool gps_int_field(const cJSON *gps, const char *name, int lo, int hi, int *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(gps, name);
+    if (item == NULL) return false;
+    if (!cJSON_IsNumber(item) || item->valuedouble != (double)item->valueint ||
+        item->valueint < lo || item->valueint > hi) {
+        ESP_LOGW(TAG, "gps.%s: not an integer in %d..%d — rejected, keeping the default",
+                 name, lo, hi);
+        return false;
+    }
+    *out = item->valueint;
+    return true;
+}
+
+/* Sets or clears `bit` in `*bits` from a §8 `gps` bool field. */
+static void gps_bool_bit(const cJSON *gps, const char *name, uint8_t bit, uint8_t *bits)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(gps, name);
+    if (!cJSON_IsBool(item)) return;
+    if (cJSON_IsTrue(item)) *bits |= bit; else *bits &= (uint8_t)~bit;
+}
+
+/* §8 `gps` (spec §8 "SAM-M10Q (IDL1)"). Each field is checked on its own;
+ * a rejected one keeps its default. The constellation rate limit is the
+ * app's to enforce — the firmware applies the rate it is given. */
 static void load_gps(const cJSON *root, idl0_config_t *cfg)
 {
     const cJSON *gps = cJSON_GetObjectItemCaseSensitive(root, "gps");
     if (!cJSON_IsObject(gps)) return;
+    idl0_gps_settings_t *g = &cfg->gps;
+    int v;
 
-    const cJSON *rate = cJSON_GetObjectItemCaseSensitive(gps, "sample_rate_hz");
-    if (cJSON_IsNumber(rate)) {
-        int r = rate->valueint;
-        cfg->gps_sample_rate_hz = (uint8_t)(r < 1 ? 1 : (r > 10 ? 10 : r));
-    }
-    const cJSON *sbas = cJSON_GetObjectItemCaseSensitive(gps, "sbas_enabled");
-    if (cJSON_IsBool(sbas)) {
-        cfg->sbas_enabled = cJSON_IsTrue(sbas);
-    }
+    if (gps_int_field(gps, "sample_rate_hz", 1, 18, &v)) g->rate_hz = (uint8_t)v;
 
+    static const struct { const char *name; uint8_t bit; } constellations[] = {
+        { "GPS", IDL0_GPS_SIG_GPS }, { "GALILEO", IDL0_GPS_SIG_GALILEO },
+        { "BEIDOU", IDL0_GPS_SIG_BEIDOU }, { "GLONASS", IDL0_GPS_SIG_GLONASS },
+    };
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(gps, "constellations");
+    if (list != NULL) {
+        uint8_t major = 0;
+        bool ok = cJSON_IsArray(list);
+        if (ok) {
+            const cJSON *s;
+            cJSON_ArrayForEach(s, list) {
+                bool known = false;
+                for (size_t i = 0; cJSON_IsString(s) && i < sizeof(constellations) / sizeof(constellations[0]); i++) {
+                    if (strcmp(s->valuestring, constellations[i].name) == 0) {
+                        major |= constellations[i].bit;
+                        known = true;
+                    }
+                }
+                if (!known) ok = false;
+            }
+        }
+        if (ok && major != 0) {
+            g->signals = (uint8_t)((g->signals & ~IDL0_GPS_SIG_MAJOR) | major);
+        } else {
+            ESP_LOGW(TAG, "gps.constellations: not a non-empty list of GPS/GALILEO/BEIDOU/GLONASS "
+                          "— rejected, keeping all four");
+        }
+    }
+    gps_bool_bit(gps, "qzss_enabled", IDL0_GPS_SIG_QZSS, &g->signals);
+    gps_bool_bit(gps, "sbas_enabled", IDL0_GPS_SIG_SBAS, &g->signals);
+
+    /* "airborne" is the <1 g model, the gentlest of the three. */
     static const struct { const char *name; uint8_t model; } models[] = {
-        { "portable",   UBX_DYNMODEL_PORTABLE },
-        { "pedestrian", UBX_DYNMODEL_PEDESTRIAN },
-        { "automotive", UBX_DYNMODEL_AUTOMOTIVE },
-        { "sea",        UBX_DYNMODEL_SEA },
-        { "airborne",   UBX_DYNMODEL_AIRBORNE_1G },
+        { "portable",    UBX_DYNMODEL_PORTABLE },
+        { "stationary",  UBX_DYNMODEL_STATIONARY },
+        { "pedestrian",  UBX_DYNMODEL_PEDESTRIAN },
+        { "automotive",  UBX_DYNMODEL_AUTOMOTIVE },
+        { "sea",         UBX_DYNMODEL_SEA },
+        { "airborne",    UBX_DYNMODEL_AIRBORNE_1G },
+        { "airborne_2g", UBX_DYNMODEL_AIRBORNE_2G },
+        { "airborne_4g", UBX_DYNMODEL_AIRBORNE_4G },
     };
     const cJSON *dm = cJSON_GetObjectItemCaseSensitive(gps, "dynamic_model");
-    if (cJSON_IsString(dm)) {
+    if (dm != NULL) {
         bool known = false;
-        for (size_t i = 0; i < sizeof(models) / sizeof(models[0]); i++) {
+        for (size_t i = 0; cJSON_IsString(dm) && i < sizeof(models) / sizeof(models[0]); i++) {
             if (strcmp(dm->valuestring, models[i].name) == 0) {
-                cfg->gps_dynamic_model = models[i].model;
+                g->dynamic_model = models[i].model;
                 known = true;
             }
         }
         if (!known) {
-            ESP_LOGW(TAG, "gps.dynamic_model: \"%s\" is unknown — keeping the default",
-                     dm->valuestring);
+            ESP_LOGW(TAG, "gps.dynamic_model: unknown — rejected, keeping the default");
         }
     }
+
+    if (gps_int_field(gps, "min_elevation_deg", 0, 60, &v))   g->min_elevation_deg = (int8_t)v;
+    if (gps_int_field(gps, "min_cno_dbhz", 0, 50, &v))        g->min_cno_dbhz = (uint8_t)v;
+    if (gps_int_field(gps, "max_satellites", 1, 32, &v))      g->max_satellites = (uint8_t)v;
+    if (gps_int_field(gps, "min_satellites", 1, 32, &v)) {
+        if (v <= g->max_satellites) {
+            g->min_satellites = (uint8_t)v;
+        } else {
+            ESP_LOGW(TAG, "gps.min_satellites: %d is above max_satellites %u — rejected, "
+                          "keeping the default", v, (unsigned)g->max_satellites);
+        }
+    }
+    if (g->min_satellites > g->max_satellites) {
+        /* A max below the default min: keep the pair consistent. */
+        ESP_LOGW(TAG, "gps.max_satellites: below min_satellites — rejected, keeping the default");
+        g->max_satellites = 32;
+    }
+    if (gps_int_field(gps, "fix_gate_satellites", 0, 32, &v)) g->fix_gate_satellites = (uint8_t)v;
+    if (gps_int_field(gps, "fix_gate_cno_dbhz", 0, 50, &v))   g->fix_gate_cno_dbhz = (uint8_t)v;
+    if (gps_int_field(gps, "position_accuracy_mask_m", 1, 100, &v)) {
+        g->position_accuracy_mask_m = (uint16_t)v;
+    }
+
+    /* PDOP mask: a number with one decimal, 1.0..25.0, sent x 10. */
+    const cJSON *pdop = cJSON_GetObjectItemCaseSensitive(gps, "pdop_mask");
+    if (pdop != NULL) {
+        const double x10 = cJSON_IsNumber(pdop) ? pdop->valuedouble * 10.0 : -1.0;
+        const long rounded = (long)(x10 + 0.5);
+        if (x10 >= 10.0 - 1e-6 && x10 <= 250.0 + 1e-6 &&
+            (x10 - (double)rounded) < 1e-6 && ((double)rounded - x10) < 1e-6) {
+            g->pdop_mask_x10 = (uint16_t)rounded;
+        } else {
+            ESP_LOGW(TAG, "gps.pdop_mask: not 1.0..25.0 in steps of 0.1 — rejected, "
+                          "keeping the default");
+        }
+    }
+
+    const cJSON *hp = cJSON_GetObjectItemCaseSensitive(gps, "high_precision_nmea");
+    if (cJSON_IsBool(hp)) g->high_precision_nmea = cJSON_IsTrue(hp);
 
     static const struct { const char *name; uint8_t bit; } sentences[] = {
         { "GLL", IDL0_GPS_NMEA_GLL }, { "GSA", IDL0_GPS_NMEA_GSA },
         { "GSV", IDL0_GPS_NMEA_GSV }, { "VTG", IDL0_GPS_NMEA_VTG },
         { "ZDA", IDL0_GPS_NMEA_ZDA },
     };
-    const cJSON *list = cJSON_GetObjectItemCaseSensitive(gps, "nmea_sentences");
-    if (cJSON_IsArray(list)) {
-        cfg->gps_nmea_extra = 0;
+    const cJSON *nmea = cJSON_GetObjectItemCaseSensitive(gps, "nmea_sentences");
+    if (cJSON_IsArray(nmea)) {
+        g->nmea_extra = 0;
         const cJSON *s;
-        cJSON_ArrayForEach(s, list) {
+        cJSON_ArrayForEach(s, nmea) {
             if (!cJSON_IsString(s)) continue;
             if (strcmp(s->valuestring, "RMC") == 0 || strcmp(s->valuestring, "GGA") == 0) {
                 continue;  /* always on */
@@ -298,7 +402,7 @@ static void load_gps(const cJSON *root, idl0_config_t *cfg)
             bool known = false;
             for (size_t i = 0; i < sizeof(sentences) / sizeof(sentences[0]); i++) {
                 if (strcmp(s->valuestring, sentences[i].name) == 0) {
-                    cfg->gps_nmea_extra |= sentences[i].bit;
+                    g->nmea_extra |= sentences[i].bit;
                     known = true;
                 }
             }

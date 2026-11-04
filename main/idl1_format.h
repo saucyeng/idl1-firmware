@@ -11,6 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "gps_driver.h"  /* idl0_gps_settings_t (pure header) */
+
 /* Format version written in the header. */
 #define IDL1_FORMAT_VERSION 1
 
@@ -39,6 +41,7 @@
 #define IDL1_REC_IMU_BLOCK       0x10
 #define IDL1_REC_LOGGER_EVENT    0x20
 #define IDL1_REC_SESSION_SUMMARY 0x21
+#define IDL1_REC_GPS_CONFIG      0x22
 #define IDL1_REC_SESSION_END     0xFF
 
 /* Registry kinds and IMU paths (spec §4.2). */
@@ -66,6 +69,14 @@
 #define IDL1_EVT_BUS_ERROR     3
 #define IDL1_EVT_IMU_LOST      4
 #define IDL1_EVT_IMU_RECOVERED 5
+
+/* GPS_CONFIG payload, bytes: version, result, requested and applied rate,
+ * signals, dynamic_model, min_elevation, min_cno, min/max satellites, fix
+ * gate satellites and C/N0 (1 each = 12), pdop_mask_x10 2,
+ * position_accuracy_mask_m 2, nmea_flags 1, nmea_extra 1, module_version 30. */
+#define IDL1_GPS_CONFIG_PAYLOAD  48
+#define IDL1_GPS_CONFIG_VERSION  1
+#define IDL1_GPS_MODULE_VERSION_BYTES 30
 
 /* LOGGER_EVENT payload, bytes: code 1, source 2, count 4, timestamp_us 8. */
 #define IDL1_LOGGER_EVENT_PAYLOAD 15
@@ -143,6 +154,14 @@ size_t idl1_format_channel_sample(uint8_t *out_buf, uint16_t channel_id,
 size_t idl1_format_logger_event(uint8_t *out_buf, uint8_t code,
                                 uint16_t source, uint32_t count,
                                 int64_t timestamp_us);
+
+/* GPS_CONFIG (spec §4.3): 51 bytes total, written once after the header.
+ * `result` is an idl0_gps_cfg_result_t; `module_version` may be NULL or
+ * "" when the module did not answer. */
+size_t idl1_format_gps_config(uint8_t *out_buf, uint8_t result,
+                              uint8_t applied_rate_hz,
+                              const idl0_gps_settings_t *settings,
+                              const char *module_version);
 
 /* SESSION_SUMMARY (spec §4.3). The three arrays hold `n_imu` entries.
  * Returns bytes written, 0 if `out_len` is short. */

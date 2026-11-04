@@ -51,7 +51,22 @@
 #define UBX_CFG_MSGOUT_NMEA_VTG_UART1   0x209100B1u
 #define UBX_CFG_MSGOUT_NMEA_ZDA_UART1   0x209100D9u
 #define UBX_CFG_NAVSPG_DYNMODEL         0x20110021u  /* E1, see UBX_DYNMODEL_* */
-#define UBX_CFG_SIGNAL_SBAS_ENA         0x10310020u  /* L; a CFG-SIGNAL change restarts the GNSS subsystem */
+#define UBX_CFG_NAVSPG_INFIL_MINSVS     0x201100A1u  /* U1, satellites; factory 3 */
+#define UBX_CFG_NAVSPG_INFIL_MAXSVS     0x201100A2u  /* U1, satellites; factory 32 */
+#define UBX_CFG_NAVSPG_INFIL_MINCNO     0x201100A3u  /* U1, dBHz; factory 6 */
+#define UBX_CFG_NAVSPG_INFIL_MINELEV    0x201100A4u  /* I1, deg; factory 5 */
+#define UBX_CFG_NAVSPG_INFIL_NCNOTHRS   0x201100AAu  /* U1, satellites; factory 0 */
+#define UBX_CFG_NAVSPG_INFIL_CNOTHRS    0x201100ABu  /* U1, dBHz; factory 0 */
+#define UBX_CFG_NAVSPG_OUTFIL_PDOP      0x301100B1u  /* U2, PDOP x 10; factory 250 */
+#define UBX_CFG_NAVSPG_OUTFIL_PACC      0x301100B3u  /* U2, m; factory 100 */
+#define UBX_CFG_NMEA_HIGHPREC           0x10930006u  /* L; factory false */
+/* CFG-SIGNAL (L each). Any change restarts the GNSS subsystem (ID §4.9.21). */
+#define UBX_CFG_SIGNAL_GPS_ENA          0x1031001Fu
+#define UBX_CFG_SIGNAL_GAL_ENA          0x10310021u
+#define UBX_CFG_SIGNAL_BDS_ENA          0x10310022u
+#define UBX_CFG_SIGNAL_GLO_ENA          0x10310025u
+#define UBX_CFG_SIGNAL_QZSS_ENA         0x10310024u
+#define UBX_CFG_SIGNAL_SBAS_ENA         0x10310020u
 
 /* CFG-NAVSPG-DYNMODEL values (ID Table 22). WRIST/BIKE/MOWER/ESCOOTER are
  * "not available in all products" and are not offered. */

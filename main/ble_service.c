@@ -196,9 +196,9 @@ static uint16_t s_status_val_handle;
 
 /* Latest status string (§7.3). Served on READ and sent on NOTIFY.
  * Sized for the full §7.3 line set; see the IDL0_STATUS_BUF_BYTES comment
- * in status.c for the count. The publisher builds into a matching 384 B
+ * in status.c for the count. The publisher builds into a matching 448 B
  * buffer — keep both in lockstep. */
-static char s_status[384] = "WiFi: OFF\nLogging: STOPPED";
+static char s_status[448] = "WiFi: OFF\nLogging: STOPPED";
 
 /* T12: guards s_status against a torn read. status_access_cb runs on the
  * NimBLE host task; idl0_ble_publish_status runs from the 1 Hz esp_timer

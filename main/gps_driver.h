@@ -13,14 +13,44 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* §8 `gps` settings the module is configured with (idl0_config_t's gps
- * fields, copied so this header stays free of the config's ESP-IDF
- * includes). */
+/* `signals` bits: constellations and augmentations enabled (§8
+ * `gps.constellations`, `qzss_enabled`, `sbas_enabled`). Same bit order as
+ * the .idl1 GPS_CONFIG record. */
+#define IDL0_GPS_SIG_GPS      (1u << 0)
+#define IDL0_GPS_SIG_GALILEO  (1u << 1)
+#define IDL0_GPS_SIG_BEIDOU   (1u << 2)
+#define IDL0_GPS_SIG_GLONASS  (1u << 3)
+#define IDL0_GPS_SIG_QZSS     (1u << 4)
+#define IDL0_GPS_SIG_SBAS     (1u << 5)
+#define IDL0_GPS_SIG_MAJOR    (IDL0_GPS_SIG_GPS | IDL0_GPS_SIG_GALILEO | \
+                               IDL0_GPS_SIG_BEIDOU | IDL0_GPS_SIG_GLONASS)
+
+/* `nmea_extra` bits: `gps.nmea_sentences` entries beyond RMC and GGA, which
+ * are always on (the fix is built from them). The others reach the UART
+ * only — the parser ignores them, so they are never logged. */
+#define IDL0_GPS_NMEA_GLL  (1u << 0)
+#define IDL0_GPS_NMEA_GSA  (1u << 1)
+#define IDL0_GPS_NMEA_GSV  (1u << 2)
+#define IDL0_GPS_NMEA_VTG  (1u << 3)
+#define IDL0_GPS_NMEA_ZDA  (1u << 4)
+
+/* The §8 `gps` block as applied to the SAM-M10Q (spec §8 "SAM-M10Q
+ * (IDL1)"). Loaded by idl0_config.c with every absent field at the
+ * module's factory value; also written per session as GPS_CONFIG. */
 typedef struct {
-    uint8_t rate_hz;        /* 1..10 Hz navigation rate */
-    bool    sbas_enabled;
-    uint8_t dynamic_model;  /* UBX_DYNMODEL_* (ubx.h) */
-    uint8_t nmea_extra;     /* IDL0_GPS_NMEA_* bits (idl0_config.h) */
+    uint8_t  rate_hz;                 /* 1..18 Hz navigation rate */
+    uint8_t  signals;                 /* IDL0_GPS_SIG_* bits */
+    uint8_t  dynamic_model;           /* UBX_DYNMODEL_* (ubx.h) */
+    int8_t   min_elevation_deg;       /* 0..60 deg */
+    uint8_t  min_cno_dbhz;            /* 0..50 dBHz */
+    uint8_t  min_satellites;          /* 1..32, <= max_satellites */
+    uint8_t  max_satellites;          /* 1..32 */
+    uint8_t  fix_gate_satellites;     /* 0..32; 0 = off */
+    uint8_t  fix_gate_cno_dbhz;       /* 0..50 dBHz */
+    uint16_t pdop_mask_x10;           /* 10..250 (PDOP 1.0..25.0) */
+    uint16_t position_accuracy_mask_m;/* 1..100 m */
+    bool     high_precision_nmea;
+    uint8_t  nmea_extra;              /* IDL0_GPS_NMEA_* bits */
 } idl0_gps_settings_t;
 
 /* Outcome of the boot-time UBX configuration. Anything but OK leaves the
@@ -41,6 +71,13 @@ const char *idl0_gps_cfg_result_str(idl0_gps_cfg_result_t r);
 /* Navigation rate the module acknowledged, Hz (1, the factory rate, until
  * a rate VALSET is acked). */
 uint8_t idl0_gps_applied_rate_hz(void);
+
+/* The settings idl0_gps_init was given (zeroed before it runs). */
+const idl0_gps_settings_t *idl0_gps_settings(void);
+
+/* UBX-MON-VER swVersion from the boot probe; "" when the module did not
+ * answer. */
+const char *idl0_gps_module_version(void);
 
 /* Parsed GPS fix — fields mirror §5.6 GPS_FIX record. */
 typedef struct {
@@ -90,6 +127,11 @@ bool idl0_gps_live(uint8_t *fix_quality, uint8_t *satellites);
 void idl0_gps_force_state(idl0_gps_state_t state);
 
 /* --- NMEA parser — exposed for host-test --- */
+
+/* Longest NMEA line handled, bytes including the NUL. NMEA's limit is 82
+ * characters, but u-blox high-precision mode (§8 gps.high_precision_nmea)
+ * adds digits to latitude, longitude and altitude and can pass it. */
+#define IDL0_NMEA_LINE_MAX 128
 
 /* Verifies a "$...*HH" NMEA line's XOR checksum. Returns true on match.
  * The trailing CR/LF (if any) must already be stripped. */
