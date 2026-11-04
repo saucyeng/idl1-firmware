@@ -13,8 +13,12 @@
 #include "esp_timer.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
+#include "idl0_config.h"  /* IDL0_GPS_NMEA_* bits */
 #include "pins.h"
+#include "ubx.h"
 
 static idl0_gps_state_t s_state = IDL0_GPS_ABSENT;
 
@@ -292,15 +296,197 @@ bool idl0_gps_live(uint8_t *fix_quality, uint8_t *satellites)
 }
 
 #define IDL0_GPS_UART       UART_NUM_1
-#define IDL0_GPS_BAUD       9600
 #define IDL0_GPS_RX_BUF     2048
+
+/* SAM-M10Q factory UART: 9600 bit/s 8N1 (data sheet UBX-22013293 Table 18).
+ * The firmware moves it to 115200 bit/s: RMC + GGA at 10 Hz is ~1.5 kB/s,
+ * over the ~0.96 kB/s 9600 bit/s carries, and the optional sentences add
+ * more. The module keeps the new rate (RAM layer) until it loses power,
+ * so an ESP reset can find it at either rate — init probes both. */
+#define IDL0_GPS_BAUD_FACTORY  9600    /* bit/s */
+#define IDL0_GPS_BAUD_RUN      115200  /* bit/s */
+
+/* UBX-ACK arrives "as soon as possible but at least within one second"
+ * (Interface Description UBX-21035062 §3.9.1); a MON-VER poll answers as
+ * fast. 1100 ms leaves a margin over that bound. */
+#define IDL0_GPS_UBX_TIMEOUT_MS  1100  /* ms */
+
+/* A CFG-SIGNAL change restarts the GNSS subsystem: "wait first for the
+ * acknowledgement from the receiver and then 0.5 seconds before sending
+ * the next command" (ID §4.9.21). */
+#define IDL0_GPS_SIGNAL_SETTLE_MS  500  /* ms */
+
+/* Highest navigation rate the data sheet gives for the factory signal set
+ * (GPS + Galileo + BeiDou B1C + GLONASS, data sheet Table 1, "Default"
+ * column, ≥98% fix rate). Above it the module still accepts the rate but
+ * may drop solutions. */
+#define IDL0_GPS_MAX_RATE_FACTORY_SIGNALS_HZ  4  /* Hz */
 
 static const char *TAG = "gps";
 
-bool idl0_gps_init(void)
+static idl0_gps_cfg_result_t s_cfg_result = IDL0_GPS_CFG_NOT_RUN;
+static uint8_t s_applied_rate_hz = 1;  /* Hz; factory default until a VALSET is acked */
+
+idl0_gps_cfg_result_t idl0_gps_config_result(void) { return s_cfg_result; }
+uint8_t idl0_gps_applied_rate_hz(void) { return s_applied_rate_hz; }
+
+const char *idl0_gps_cfg_result_str(idl0_gps_cfg_result_t r)
+{
+    switch (r) {
+        case IDL0_GPS_CFG_OK:          return "OK";
+        case IDL0_GPS_CFG_NO_RESPONSE: return "NO_RESPONSE";
+        case IDL0_GPS_CFG_BAUD_FAILED: return "BAUD_FAILED";
+        case IDL0_GPS_CFG_NAK:         return "NAK";
+        case IDL0_GPS_CFG_NO_ACK:      return "NO_ACK";
+        case IDL0_GPS_CFG_ENCODE:      return "ENCODE";
+        case IDL0_GPS_CFG_NOT_RUN:
+        default:                       return "NOT_RUN";
+    }
+}
+
+/* Reads the UART into `p` until a frame matching cls/id completes (true)
+ * or the timeout passes (false). Bytes of other traffic, NMEA included,
+ * are consumed and dropped — only called before the GPS task starts. */
+static bool ubx_wait_frame(ubx_parser_t *p, uint8_t cls, uint8_t id, int timeout_ms)
+{
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    uint8_t chunk[64];
+    while (esp_timer_get_time() < deadline) {
+        int n = uart_read_bytes(IDL0_GPS_UART, chunk, sizeof(chunk), pdMS_TO_TICKS(20));
+        for (int i = 0; i < n; i++) {
+            if (ubx_parser_feed(p, chunk[i]) && p->cls == cls && p->id == id) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Polls UBX-MON-VER at the UART's current rate. True when the module
+ * answers; its swVersion string is logged. */
+static bool ubx_probe(void)
+{
+    uint8_t frame[UBX_FRAME_OVERHEAD];
+    size_t n = ubx_frame(frame, sizeof(frame), UBX_CLASS_MON, UBX_ID_MON_VER, NULL, 0);
+    uart_flush_input(IDL0_GPS_UART);
+    uart_write_bytes(IDL0_GPS_UART, frame, n);
+
+    ubx_parser_t p;
+    ubx_parser_init(&p);
+    if (!ubx_wait_frame(&p, UBX_CLASS_MON, UBX_ID_MON_VER, IDL0_GPS_UBX_TIMEOUT_MS) ||
+        p.len < 40) {
+        return false;
+    }
+    char sw[31], hw[11];
+    memcpy(sw, p.payload, 30);      sw[30] = '\0';  /* CH[30] swVersion */
+    memcpy(hw, p.payload + 30, 10); hw[10] = '\0';  /* CH[10] hwVersion */
+    ESP_LOGI(TAG, "module: sw \"%s\" hw \"%s\"", sw, hw);
+    return true;
+}
+
+/* Sends a VALSET and waits for its ACK. */
+static idl0_gps_cfg_result_t ubx_valset_send(const ubx_valset_t *v)
+{
+    uint8_t frame[sizeof(v->buf) + UBX_FRAME_OVERHEAD];
+    size_t n = ubx_valset_frame(v, frame, sizeof(frame));
+    if (n == 0) return IDL0_GPS_CFG_ENCODE;
+    uart_write_bytes(IDL0_GPS_UART, frame, n);
+
+    ubx_parser_t p;
+    ubx_parser_init(&p);
+    const int64_t deadline = esp_timer_get_time() + (int64_t)IDL0_GPS_UBX_TIMEOUT_MS * 1000;
+    uint8_t chunk[64];
+    while (esp_timer_get_time() < deadline) {
+        int got = uart_read_bytes(IDL0_GPS_UART, chunk, sizeof(chunk), pdMS_TO_TICKS(20));
+        for (int i = 0; i < got; i++) {
+            if (!ubx_parser_feed(&p, chunk[i])) continue;
+            switch (ubx_parser_ack_for(&p, UBX_CLASS_CFG, UBX_ID_CFG_VALSET)) {
+                case UBX_ACK_ACK: return IDL0_GPS_CFG_OK;
+                case UBX_ACK_NAK: return IDL0_GPS_CFG_NAK;
+                case UBX_ACK_NONE: break;
+            }
+        }
+    }
+    return IDL0_GPS_CFG_NO_ACK;
+}
+
+/* Moves module and host from the factory rate to IDL0_GPS_BAUD_RUN. The
+ * ACK for a baud change may be sent at either rate, so it is not waited
+ * on: the MON-VER probe at the new rate is the proof. */
+static bool ubx_switch_baud(void)
+{
+    ubx_valset_t v;
+    ubx_valset_init(&v, UBX_LAYER_RAM);
+    ubx_valset_add(&v, UBX_CFG_UART1_BAUDRATE, IDL0_GPS_BAUD_RUN);
+    uint8_t frame[32];
+    size_t n = ubx_valset_frame(&v, frame, sizeof(frame));
+    if (n == 0) return false;
+    uart_write_bytes(IDL0_GPS_UART, frame, n);
+    uart_wait_tx_done(IDL0_GPS_UART, pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(100));  /* let the module finish and switch */
+    uart_set_baudrate(IDL0_GPS_UART, IDL0_GPS_BAUD_RUN);
+    return ubx_probe();
+}
+
+/* Applies the §8 `gps` settings (RAM layer). Runs once at boot with the UART
+ * to itself, before the GPS task reads it. A failure leaves the module on
+ * whatever it was running — still NMEA at ≥1 Hz — and is reported. */
+static idl0_gps_cfg_result_t gps_configure(const idl0_gps_settings_t *cfg)
+{
+    /* Find the module: factory rate first (cold power-up), then the run
+     * rate (an ESP reset with the module still powered). */
+    bool at_run_baud = false;
+    if (!ubx_probe()) {
+        uart_set_baudrate(IDL0_GPS_UART, IDL0_GPS_BAUD_RUN);
+        if (!ubx_probe()) {
+            uart_set_baudrate(IDL0_GPS_UART, IDL0_GPS_BAUD_FACTORY);
+            return IDL0_GPS_CFG_NO_RESPONSE;
+        }
+        at_run_baud = true;
+    }
+    if (!at_run_baud && !ubx_switch_baud()) {
+        /* Lost it mid-switch: try the factory rate again, else give up. */
+        uart_set_baudrate(IDL0_GPS_UART, IDL0_GPS_BAUD_FACTORY);
+        if (!ubx_probe()) return IDL0_GPS_CFG_BAUD_FAILED;
+        ESP_LOGW(TAG, "baud switch to %d failed — staying at %d",
+                 IDL0_GPS_BAUD_RUN, IDL0_GPS_BAUD_FACTORY);
+    }
+
+    const uint8_t rate_hz = (cfg->rate_hz < 1) ? 1 : (cfg->rate_hz > 10 ? 10 : cfg->rate_hz);
+    ubx_valset_t v;
+    ubx_valset_init(&v, UBX_LAYER_RAM);
+    ubx_valset_add(&v, UBX_CFG_RATE_MEAS, (uint64_t)(1000 / rate_hz));  /* ms */
+    ubx_valset_add(&v, UBX_CFG_RATE_NAV, 1);  /* one solution per measurement */
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_RMC_UART1, 1);
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_GGA_UART1, 1);
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_GLL_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_GLL) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_GSA_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_GSA) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_GSV_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_GSV) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_VTG_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_VTG) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_MSGOUT_NMEA_ZDA_UART1, (cfg->nmea_extra & IDL0_GPS_NMEA_ZDA) ? 1 : 0);
+    ubx_valset_add(&v, UBX_CFG_NAVSPG_DYNMODEL, cfg->dynamic_model);
+    idl0_gps_cfg_result_t r = ubx_valset_send(&v);
+    if (r != IDL0_GPS_CFG_OK) return r;
+    s_applied_rate_hz = rate_hz;
+    if (rate_hz > IDL0_GPS_MAX_RATE_FACTORY_SIGNALS_HZ) {
+        ESP_LOGW(TAG, "%u Hz is above the %d Hz the data sheet gives for four "
+                      "constellations — solutions may be dropped",
+                 (unsigned)rate_hz, IDL0_GPS_MAX_RATE_FACTORY_SIGNALS_HZ);
+    }
+
+    /* SBAS on its own: a CFG-SIGNAL change restarts the GNSS subsystem.
+     * Sent every boot, since the module may hold a previous boot's value. */
+    ubx_valset_init(&v, UBX_LAYER_RAM);
+    ubx_valset_add(&v, UBX_CFG_SIGNAL_SBAS_ENA, cfg->sbas_enabled ? 1 : 0);
+    r = ubx_valset_send(&v);
+    vTaskDelay(pdMS_TO_TICKS(IDL0_GPS_SIGNAL_SETTLE_MS));
+    return r;
+}
+
+bool idl0_gps_init(const idl0_gps_settings_t *settings)
 {
     const uart_config_t cfg = {
-        .baud_rate  = IDL0_GPS_BAUD,
+        .baud_rate  = IDL0_GPS_BAUD_FACTORY,
         .data_bits  = UART_DATA_8_BITS,
         .parity     = UART_PARITY_DISABLE,
         .stop_bits  = UART_STOP_BITS_1,
@@ -320,12 +506,10 @@ bool idl0_gps_init(void)
         s_state = IDL0_GPS_ABSENT;
         return false;
     }
-    /* IDL1 wires host TX (IDL1_PIN_GPS_TX, GPIO16) to the module, but
-     * phase 1 sends nothing: TX stays unmapped (UART_PIN_NO_CHANGE) and the
-     * module runs at factory defaults, as on IDL0. TODO(idl0): map TX and
-     * emit UBX-CFG-* here once the GPS port lands (bring-up phase 2). */
+    /* IDL1 wires host TX (GPIO16) to the module's RXD, so the firmware can
+     * configure it over UBX (IDL0's TX trace was open). */
     err = uart_set_pin(IDL0_GPS_UART,
-                       UART_PIN_NO_CHANGE,   /* tx */
+                       IDL1_PIN_GPS_TX,      /* tx */
                        IDL1_PIN_GPS_RX,      /* rx */
                        UART_PIN_NO_CHANGE,
                        UART_PIN_NO_CHANGE);
@@ -336,7 +520,18 @@ bool idl0_gps_init(void)
         return false;
     }
     s_state = IDL0_GPS_NOFIX;
-    ESP_LOGI(TAG, "GPS UART up on RX=%d @ %d baud (TX unmapped)",
-             IDL1_PIN_GPS_RX, IDL0_GPS_BAUD);
+
+    /* A configuration failure is reported, not fatal: the module still
+     * streams NMEA at whatever it was last set to. */
+    s_cfg_result = gps_configure(settings);
+    if (s_cfg_result == IDL0_GPS_CFG_OK) {
+        ESP_LOGI(TAG, "GPS configured: %u Hz, dynamic model %u, SBAS %s, extra NMEA 0x%02x",
+                 (unsigned)s_applied_rate_hz, (unsigned)settings->dynamic_model,
+                 settings->sbas_enabled ? "on" : "off", (unsigned)settings->nmea_extra);
+    } else {
+        ESP_LOGE(TAG, "GPS configuration failed (%s) — module left at its current settings",
+                 idl0_gps_cfg_result_str(s_cfg_result));
+    }
+    uart_flush_input(IDL0_GPS_UART);
     return true;
 }

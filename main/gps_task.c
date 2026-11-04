@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 
 #include "gps_driver.h"
+#include "idl0_config.h"
 #include "idl1_format.h"
 #include "mode_state.h"
 #include "session.h"
@@ -19,8 +20,8 @@
 #define IDL0_GPS_LINE_BUF    96
 #define IDL0_GPS_READ_CHUNK  128
 
-/* Lost-lock threshold: with the module emitting at 1 Hz, five seconds
- * of silence is well past any single-sentence checksum hiccup. */
+/* Lost-lock threshold: even at the slowest rate (1 Hz), five seconds of
+ * silence is well past any single-sentence checksum hiccup. */
 #define IDL0_GPS_LOST_LOCK_US (5 * 1000 * 1000LL)
 
 static const char *TAG = "gps_task";
@@ -173,7 +174,17 @@ bool idl0_gps_task_start(void)
     if (s_task != NULL) {
         return true;
     }
-    if (!idl0_gps_init()) {
+    /* §8 `gps` is read once here: a config push reboots the device
+     * (§7.2), so boot is the only time it changes. */
+    idl0_config_t cfg;
+    idl0_config_load(&cfg);  /* defaults on failure — always usable */
+    const idl0_gps_settings_t settings = {
+        .rate_hz       = cfg.gps_sample_rate_hz,
+        .sbas_enabled  = cfg.sbas_enabled,
+        .dynamic_model = cfg.gps_dynamic_model,
+        .nmea_extra    = cfg.gps_nmea_extra,
+    };
+    if (!idl0_gps_init(&settings)) {
         ESP_LOGE(TAG, "gps init failed");
         return false;
     }

@@ -15,6 +15,7 @@ idf_component_register(
          "status.c"
          "gps_driver.c"
          "gps_task.c"
+         "ubx.c"
          "imu_driver.c"
          "imu_driver_i2c.c"
          "imu_chip_dsv320x.c"

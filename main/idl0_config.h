@@ -72,9 +72,12 @@ typedef struct {
      * object in idl0_config.json. */
     uint32_t imu_channel_mask;
 
-    /* GPS */
-    uint8_t gps_sample_rate_hz;  /* 1..10 */
-    bool sbas_enabled;
+    /* GPS (§8 `gps`), applied to the SAM-M10Q over UBX at boot
+     * (gps_driver.c). */
+    uint8_t gps_sample_rate_hz;  /* 1..10 Hz */
+    bool sbas_enabled;           /* default true, the module's factory value */
+    uint8_t gps_dynamic_model;   /* UBX_DYNMODEL_* (ubx.h); default portable, the factory value */
+    uint8_t gps_nmea_extra;      /* IDL0_GPS_NMEA_* bits: sentences output beyond RMC + GGA */
 
     /* BLE Heart Rate Monitor (§7.5 / §8). hrm.enabled gates everything;
      * a missing `heart_rate_monitor` block in the JSON disables HRM. */
@@ -102,6 +105,15 @@ typedef struct {
     /* Computed */
     uint32_t config_crc32;
 } idl0_config_t;
+
+/* `gps.nmea_sentences` entries beyond RMC and GGA, which are always on
+ * (the fix is built from them). The others reach the UART only — the
+ * parser ignores them, so they are never logged. */
+#define IDL0_GPS_NMEA_GLL  (1u << 0)
+#define IDL0_GPS_NMEA_GSA  (1u << 1)
+#define IDL0_GPS_NMEA_GSV  (1u << 2)
+#define IDL0_GPS_NMEA_VTG  (1u << 3)
+#define IDL0_GPS_NMEA_ZDA  (1u << 4)
 
 /* Load /idl0_config.json from SD. Returns true on success. On failure,
  * out_config is populated with safe defaults. */

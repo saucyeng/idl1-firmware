@@ -1,10 +1,10 @@
-/* u-blox MAX-M10S GPS driver — NMEA parser + UART RX.
+/* u-blox SAM-M10Q GPS driver — UBX configuration at boot, NMEA parser,
+ * UART.
  *
- * P6 hardware limitation: the ESP→module TX trace is open on the
- * current board revision, so the firmware cannot send UBX commands.
- * The module runs at factory defaults: 9600 baud, RMC/GGA at 1 Hz
- * (we ignore the other default sentences). When TX is rewired, the
- * UBX init burst is added behind idl0_gps_init() — TODO(idl0).
+ * IDL1 wires both UART directions (IDL0's MAX-M10S had an open TX trace
+ * and ran at factory defaults). idl0_gps_init applies the §8 `gps` block
+ * to the module over UBX-CFG-VALSET (RAM layer, re-applied every boot),
+ * then the GPS task reads RMC + GGA from the same UART.
  */
 
 #pragma once
@@ -13,10 +13,34 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* The rate the module actually emits at, used by the file-header
- * gps_sample_rate_hz field (§5.1). With TX broken we cannot reconfigure
- * the module, so this is the factory default. */
-#define IDL0_GPS_ACTUAL_RATE_HZ 1
+/* §8 `gps` settings the module is configured with (idl0_config_t's gps
+ * fields, copied so this header stays free of the config's ESP-IDF
+ * includes). */
+typedef struct {
+    uint8_t rate_hz;        /* 1..10 Hz navigation rate */
+    bool    sbas_enabled;
+    uint8_t dynamic_model;  /* UBX_DYNMODEL_* (ubx.h) */
+    uint8_t nmea_extra;     /* IDL0_GPS_NMEA_* bits (idl0_config.h) */
+} idl0_gps_settings_t;
+
+/* Outcome of the boot-time UBX configuration. Anything but OK leaves the
+ * module on its previous settings, still streaming NMEA. */
+typedef enum {
+    IDL0_GPS_CFG_NOT_RUN = 0,  /* idl0_gps_init not reached the module yet */
+    IDL0_GPS_CFG_OK,           /* every VALSET acknowledged */
+    IDL0_GPS_CFG_NO_RESPONSE,  /* no MON-VER reply at 9600 or 115200 bit/s */
+    IDL0_GPS_CFG_BAUD_FAILED,  /* lost the module while changing rate */
+    IDL0_GPS_CFG_NAK,          /* module rejected a VALSET (UBX-ACK-NAK) */
+    IDL0_GPS_CFG_NO_ACK,       /* no UBX-ACK within 1.1 s */
+    IDL0_GPS_CFG_ENCODE,       /* VALSET did not encode (firmware bug) */
+} idl0_gps_cfg_result_t;
+
+idl0_gps_cfg_result_t idl0_gps_config_result(void);
+const char *idl0_gps_cfg_result_str(idl0_gps_cfg_result_t r);
+
+/* Navigation rate the module acknowledged, Hz (1, the factory rate, until
+ * a rate VALSET is acked). */
+uint8_t idl0_gps_applied_rate_hz(void);
 
 /* Parsed GPS fix — fields mirror §5.6 GPS_FIX record. */
 typedef struct {
@@ -39,8 +63,11 @@ typedef enum {
     IDL0_GPS_FIX,         /* at least one RMC with status='A' seen */
 } idl0_gps_state_t;
 
-/* Initialise UART RX (TX pin not wired). Returns true on success. */
-bool idl0_gps_init(void);
+/* Opens the UART and configures the module with `settings` (blocks up to
+ * ~5 s when the module does not answer). Returns false only when the UART
+ * itself fails; a configuration failure is reported by
+ * idl0_gps_config_result. */
+bool idl0_gps_init(const idl0_gps_settings_t *settings);
 
 idl0_gps_state_t idl0_gps_state(void);
 const char *idl0_gps_state_str(idl0_gps_state_t state);

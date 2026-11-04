@@ -17,6 +17,7 @@
 #include "idl1_format.h"
 #include "imu_ranges.h"
 #include "sd_logger.h"
+#include "ubx.h"
 
 static const char *TAG = "config";
 
@@ -82,6 +83,8 @@ static void fill_defaults(idl0_config_t *cfg)
     cfg->hg_sample_rate_hz    = IDL1_IMU_DEFAULT_HG_ODR_HZ;
     cfg->hg_range_g           = IDL1_IMU_DEFAULT_HG_RANGE_G;
     cfg->gps_sample_rate_hz   = 5;
+    cfg->sbas_enabled         = true;
+    cfg->gps_dynamic_model    = UBX_DYNMODEL_PORTABLE;
     cfg->imu_channel_mask     = DEFAULT_IMU_MASK;
     cfg->config_crc32         = 0;
     /* HRM disabled by default; channel IDs match spec §5.2 so status.c
@@ -235,6 +238,75 @@ static void load_wheel_speed(const cJSON *root, idl0_config_t *cfg)
         if (!cJSON_IsObject(slot)) continue;
         const cJSON *en = cJSON_GetObjectItemCaseSensitive(slot, "enabled");
         cfg->wheel_enabled[i] = cJSON_IsTrue(en);
+    }
+}
+
+/* §8 `gps`. dynamic_model takes the spec's five names; "airborne" is the
+ * <1 g model, the gentlest of the three. An unknown name or sentence is
+ * logged and skipped, keeping the default. */
+static void load_gps(const cJSON *root, idl0_config_t *cfg)
+{
+    const cJSON *gps = cJSON_GetObjectItemCaseSensitive(root, "gps");
+    if (!cJSON_IsObject(gps)) return;
+
+    const cJSON *rate = cJSON_GetObjectItemCaseSensitive(gps, "sample_rate_hz");
+    if (cJSON_IsNumber(rate)) {
+        int r = rate->valueint;
+        cfg->gps_sample_rate_hz = (uint8_t)(r < 1 ? 1 : (r > 10 ? 10 : r));
+    }
+    const cJSON *sbas = cJSON_GetObjectItemCaseSensitive(gps, "sbas_enabled");
+    if (cJSON_IsBool(sbas)) {
+        cfg->sbas_enabled = cJSON_IsTrue(sbas);
+    }
+
+    static const struct { const char *name; uint8_t model; } models[] = {
+        { "portable",   UBX_DYNMODEL_PORTABLE },
+        { "pedestrian", UBX_DYNMODEL_PEDESTRIAN },
+        { "automotive", UBX_DYNMODEL_AUTOMOTIVE },
+        { "sea",        UBX_DYNMODEL_SEA },
+        { "airborne",   UBX_DYNMODEL_AIRBORNE_1G },
+    };
+    const cJSON *dm = cJSON_GetObjectItemCaseSensitive(gps, "dynamic_model");
+    if (cJSON_IsString(dm)) {
+        bool known = false;
+        for (size_t i = 0; i < sizeof(models) / sizeof(models[0]); i++) {
+            if (strcmp(dm->valuestring, models[i].name) == 0) {
+                cfg->gps_dynamic_model = models[i].model;
+                known = true;
+            }
+        }
+        if (!known) {
+            ESP_LOGW(TAG, "gps.dynamic_model: \"%s\" is unknown — keeping the default",
+                     dm->valuestring);
+        }
+    }
+
+    static const struct { const char *name; uint8_t bit; } sentences[] = {
+        { "GLL", IDL0_GPS_NMEA_GLL }, { "GSA", IDL0_GPS_NMEA_GSA },
+        { "GSV", IDL0_GPS_NMEA_GSV }, { "VTG", IDL0_GPS_NMEA_VTG },
+        { "ZDA", IDL0_GPS_NMEA_ZDA },
+    };
+    const cJSON *list = cJSON_GetObjectItemCaseSensitive(gps, "nmea_sentences");
+    if (cJSON_IsArray(list)) {
+        cfg->gps_nmea_extra = 0;
+        const cJSON *s;
+        cJSON_ArrayForEach(s, list) {
+            if (!cJSON_IsString(s)) continue;
+            if (strcmp(s->valuestring, "RMC") == 0 || strcmp(s->valuestring, "GGA") == 0) {
+                continue;  /* always on */
+            }
+            bool known = false;
+            for (size_t i = 0; i < sizeof(sentences) / sizeof(sentences[0]); i++) {
+                if (strcmp(s->valuestring, sentences[i].name) == 0) {
+                    cfg->gps_nmea_extra |= sentences[i].bit;
+                    known = true;
+                }
+            }
+            if (!known) {
+                ESP_LOGW(TAG, "gps.nmea_sentences: \"%s\" is unknown — skipped",
+                         s->valuestring);
+            }
+        }
     }
 }
 
@@ -543,19 +615,7 @@ bool idl0_config_load(idl0_config_t *out_config)
     load_analog(root, out_config);
     load_digital(root, out_config);
     load_wheel_speed(root, out_config);
-
-    const cJSON *gps = cJSON_GetObjectItemCaseSensitive(root, "gps");
-    if (cJSON_IsObject(gps)) {
-        const cJSON *rate = cJSON_GetObjectItemCaseSensitive(gps, "sample_rate_hz");
-        if (cJSON_IsNumber(rate)) {
-            int r = rate->valueint;
-            out_config->gps_sample_rate_hz = (uint8_t)(r < 1 ? 1 : (r > 10 ? 10 : r));
-        }
-        const cJSON *sbas = cJSON_GetObjectItemCaseSensitive(gps, "sbas_enabled");
-        if (cJSON_IsBool(sbas)) {
-            out_config->sbas_enabled = cJSON_IsTrue(sbas);
-        }
-    }
+    load_gps(root, out_config);
 
     /* F10: write the healed tree back, through the same tmp+rename path a
      * config push uses, and take the CRC from the new bytes so this boot's

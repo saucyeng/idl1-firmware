@@ -101,3 +101,15 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # flight stalls and times out. Those timeouts latched the front pod down and
 # failed TLA2528 LED writes (2026-10-19).
 CONFIG_I2C_ISR_IRAM_SAFE=y
+
+# Console on the USB Serial/JTAG port only. The default primary console is
+# UART0, whose C6 default TX pin is GPIO16 — on IDL1 that is the GPS
+# module's RXD (GPS_RX_TO_MCU_TX), so every boot log line was sent into
+# the SAM-M10Q. `idf.py monitor` already uses the USB port (/dev/ttyACM0).
+# The chip ROM's own reset banner still goes out UART0; the module drops
+# it as non-protocol bytes.
+# NOTE: the second-stage bootloader's log follows this too, and the
+# bootloader is never OTA-updated: devices keep sending its lines to the
+# GPS until one USB flash. Harmless meanwhile (the app moves GPIO16 to
+# UART1 before configuring the module).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
