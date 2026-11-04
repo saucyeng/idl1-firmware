@@ -83,8 +83,9 @@ static void fill_defaults(idl0_config_t *cfg)
     cfg->hg_sample_rate_hz    = IDL1_IMU_DEFAULT_HG_ODR_HZ;
     cfg->hg_range_g           = IDL1_IMU_DEFAULT_HG_RANGE_G;
     /* GPS: the SAM-M10Q's factory values (spec §8 "SAM-M10Q (IDL1)"),
-     * except the rate. */
-    cfg->gps.rate_hz                  = 5;
+     * except the rate: 4 Hz, the most the factory four constellations
+     * hold (data sheet UBX-22013293 Table 1). */
+    cfg->gps.rate_hz                  = 4;
     cfg->gps.signals                  = IDL0_GPS_SIG_MAJOR | IDL0_GPS_SIG_QZSS | IDL0_GPS_SIG_SBAS;
     cfg->gps.dynamic_model            = UBX_DYNMODEL_PORTABLE;
     cfg->gps.min_elevation_deg        = 5;
